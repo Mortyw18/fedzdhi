@@ -97,3 +97,39 @@ def test_render_daily_report_is_human_readable():
     text = acc.render_daily_report()
     assert "Daily Report" in text
     assert "Trades closed" in text
+
+
+def test_rpc_budget_shows_up_in_daily_report():
+    """This is the audit trail requested for the free-tier RPC budget: it
+    must survive process restarts, since --daily-report is a one-shot
+    command that never starts a live RpcGateway -- it can only read back
+    what the running bot already persisted."""
+    acc = _acc()
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    now = time.time()
+
+    acc.record_rpc_snapshot(
+        {"calls_per_minute": 40, "rate_limit_per_10s": 100, "budget_usage_pct": 0.40, "total_calls": 400, "top_methods": {"getAccountInfo": 300}},
+        timestamp=now,
+    )
+    acc.record_rpc_snapshot(
+        {"calls_per_minute": 95, "rate_limit_per_10s": 100, "budget_usage_pct": 0.95, "total_calls": 900, "top_methods": {"getAccountInfo": 700}},
+        timestamp=now + 60,
+    )
+
+    report = acc.daily_report(today)
+    assert report["rpc_budget"]["snapshots"] == 2
+    assert report["rpc_budget"]["peak_calls_per_minute"] == 95
+    assert report["rpc_budget"]["peak_budget_usage_pct"] == 0.95
+    assert report["rpc_budget"]["avg_calls_per_minute"] == 67.5
+    assert any("RPC budget" in w for w in report["warnings"])  # peaked >= 90%
+
+    text = acc.render_daily_report(today)
+    assert "RPC budget" in text
+
+
+def test_rpc_budget_absent_produces_no_false_warning():
+    acc = _acc()
+    report = acc.daily_report()
+    assert report["rpc_budget"]["snapshots"] == 0
+    assert not any("RPC budget" in w for w in report["warnings"])

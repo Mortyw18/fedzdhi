@@ -15,7 +15,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from bot.models import Candidate, Fill, Position, SafetyVerdict
+from bot.models import Candidate, Fill, Position, SafetyVerdict, now_ts
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidates (
@@ -70,6 +70,19 @@ CREATE TABLE IF NOT EXISTS fills (
     tx_sig TEXT,
     timestamp REAL,
     reason TEXT
+);
+
+-- Periodic snapshots of RpcGateway.get_call_stats(), so the RPC budget is
+-- something you can audit after the fact via --daily-report, not just
+-- something visible while the bot happens to be running.
+CREATE TABLE IF NOT EXISTS rpc_budget_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL,
+    calls_per_minute INTEGER,
+    rate_limit_per_10s INTEGER,
+    budget_usage_pct REAL,
+    total_calls INTEGER,
+    top_methods_json TEXT
 );
 """
 
@@ -176,6 +189,25 @@ class Accounting:
         )
         self.conn.commit()
 
+    def record_rpc_snapshot(self, stats: dict, timestamp: Optional[float] = None) -> None:
+        """`stats` is RpcGateway.get_call_stats()'s output. Called
+        periodically by Orchestrator (not per-RPC-call -- that would just
+        move the budget problem into SQLite writes)."""
+        self.conn.execute(
+            """INSERT INTO rpc_budget_snapshots
+               (timestamp, calls_per_minute, rate_limit_per_10s, budget_usage_pct, total_calls, top_methods_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                timestamp if timestamp is not None else now_ts(),
+                stats.get("calls_per_minute", 0),
+                stats.get("rate_limit_per_10s", 0),
+                stats.get("budget_usage_pct", 0.0),
+                stats.get("total_calls", 0),
+                json.dumps(stats.get("top_methods", {})),
+            ),
+        )
+        self.conn.commit()
+
     # ------------------------------------------------------------------
     # reads / reporting
     # ------------------------------------------------------------------
@@ -223,6 +255,26 @@ class Accounting:
         total_fees = sum(f["fee_sol"] or 0.0 for f in fills_today)
         pnl_before_fees = pnl_after_fees + total_fees
 
+        rpc_snapshots = self.conn.execute(
+            "SELECT * FROM rpc_budget_snapshots WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+            (start, end),
+        ).fetchall()
+        if rpc_snapshots:
+            avg_calls_per_minute = sum(s["calls_per_minute"] for s in rpc_snapshots) / len(rpc_snapshots)
+            peak_calls_per_minute = max(s["calls_per_minute"] for s in rpc_snapshots)
+            peak_budget_usage_pct = max(s["budget_usage_pct"] for s in rpc_snapshots)
+            top_methods = json.loads(rpc_snapshots[-1]["top_methods_json"] or "{}")
+        else:
+            avg_calls_per_minute = peak_calls_per_minute = peak_budget_usage_pct = 0
+            top_methods = {}
+        rpc_budget = {
+            "snapshots": len(rpc_snapshots),
+            "avg_calls_per_minute": round(avg_calls_per_minute, 1),
+            "peak_calls_per_minute": peak_calls_per_minute,
+            "peak_budget_usage_pct": round(peak_budget_usage_pct, 4),
+            "top_methods": top_methods,
+        }
+
         report: dict = {
             "date": date_str,
             "signals": signal_count,
@@ -234,11 +286,16 @@ class Accounting:
             "pnl_after_fees_sol": round(pnl_after_fees, 6),
             "total_fees_sol": round(total_fees, 6),
             "per_leader_pnl": self.per_leader_pnl(),
+            "rpc_budget": rpc_budget,
             "warnings": [],
         }
         if total_verdicts > 0 and pass_rate > 0.70:
             report["warnings"].append(
                 f"safety pass rate is {pass_rate:.0%} (> 70%) -- thresholds are almost certainly too loose"
+            )
+        if rpc_snapshots and peak_budget_usage_pct >= 0.90:
+            report["warnings"].append(
+                f"RPC budget usage peaked at {peak_budget_usage_pct:.0%} today -- one step from 429s/an outage halt"
             )
         return report
 
@@ -258,6 +315,18 @@ class Accounting:
             lines.append("Per-leader PnL:")
             for row in r["per_leader_pnl"]:
                 lines.append(f"  {row['leader_wallet']}: {row['trades']} trades, {row['pnl_sol']:.4f} SOL")
+
+        rb = r["rpc_budget"]
+        if rb["snapshots"]:
+            top_methods_str = ", ".join(f"{name}={n}" for name, n in rb["top_methods"].items()) or "none"
+            lines.append(
+                f"RPC budget: avg {rb['avg_calls_per_minute']:.1f}/min, peak {rb['peak_calls_per_minute']}/min, "
+                f"peak usage {rb['peak_budget_usage_pct']:.0%} of the 10s rate limit"
+            )
+            lines.append(f"RPC top methods (most recent snapshot): {top_methods_str}")
+        else:
+            lines.append("RPC budget: no snapshots recorded today (bot wasn't running, or just started)")
+
         for w in r["warnings"]:
             lines.append(f"WARNING: {w}")
         return "\n".join(lines)

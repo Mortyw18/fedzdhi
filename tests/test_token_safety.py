@@ -44,7 +44,7 @@ def _pool_owned_holder_accounts(rpc: FakeRpc, mint: str, total_supply: int, n: i
     accounts = []
     for i in range(n):
         addr = make_pubkey(10 + i)
-        pool_authority = make_pubkey(20 + i)
+        pool_authority = make_pubkey(200 + i)  # far from addr's range so n can safely grow
         accounts.append({"address": addr, "amount": str(total_supply // 10)})
         rpc.accounts[addr] = {"owner": TOKEN_PROGRAM_ID, "data": {"parsed": {"info": {"owner": pool_authority}}}}
         rpc.accounts[pool_authority] = {"owner": RAYDIUM_AMM_V4}
@@ -165,6 +165,44 @@ def test_clean_token_passes_everything():
     verdict = safety.evaluate(_base_candidate(mint), position_size_lamports=50_000_000, wallet_pubkey=make_pubkey(2))
 
     assert verdict.passed is True, verdict.rejection_reasons
+
+
+def test_holder_concentration_batches_owner_lookups_instead_of_one_per_holder():
+    """This is the RPC-budget-death-spiral fix: the old implementation made
+    up to 2 individual getAccountInfo calls per top holder (owner lookup +
+    pool-authority lookup), so 20 holders cost ~40 calls on this ONE check
+    alone. The batched version costs exactly 2 getMultipleAccounts calls
+    no matter how many holders there are."""
+    mint = make_pubkey(60)
+    rpc = FakeRpc()
+    rpc.accounts[mint] = _clean_mint_account()
+    _pool_owned_holder_accounts(rpc, mint, 1_000_000, n=20)  # the worst case for the old per-holder approach
+    jupiter = FakeJupiter(quote_fn=lambda i, o, a: FakeQuoteResult(a, a, 0.01))
+    safety = _make_safety(rpc, jupiter)
+
+    verdict = safety.evaluate(_base_candidate(mint), position_size_lamports=50_000_000, wallet_pubkey=make_pubkey(2))
+
+    assert verdict.passed is True, verdict.rejection_reasons
+    assert rpc.call_log.count("getMultipleAccounts") == 2  # owners, then pool-authority-of-owners
+    assert rpc.call_log.count("getAccountInfo") == 1  # only the mint account, shared with the freeze-authority check
+    assert rpc.call_log.count("getTokenLargestAccounts") == 1
+    assert rpc.call_log.count("getTokenSupply") == 1
+
+
+def test_mint_account_fetched_once_and_shared_across_checks():
+    """check_mint_freeze_authority and check_transfer_fee_extension both
+    need the mint account; evaluate() must fetch it once and share it,
+    not fetch it twice."""
+    mint = make_pubkey(61)
+    rpc = FakeRpc()
+    rpc.accounts[mint] = _clean_mint_account()
+    _pool_owned_holder_accounts(rpc, mint, 1_000_000)
+    jupiter = FakeJupiter(quote_fn=lambda i, o, a: FakeQuoteResult(a, a, 0.01))
+    safety = _make_safety(rpc, jupiter)
+
+    safety.evaluate(_base_candidate(mint), position_size_lamports=50_000_000, wallet_pubkey=make_pubkey(2))
+
+    assert rpc.call_log.count("getAccountInfo") == 1
 
 
 def test_price_impact_over_ceiling_rejected():

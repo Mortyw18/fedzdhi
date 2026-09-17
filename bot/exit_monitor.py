@@ -95,9 +95,11 @@ class ExitMonitor:
         try:
             fill = self.execution.sell(position, fraction_of_remaining, reason, decimals, emergency=emergency)
         except ExecutionFailed as exc:
-            self.risk_manager.register_execution_failure()
+            newly_tripped = self.risk_manager.register_execution_failure()
             self.logger.error("exit execution failed for %s: %s", position.id, exc)
             self.alerter.notify(f"EXIT FAILED {position.symbol} ({reason.value}): {exc}")
+            if newly_tripped:
+                self.alerter.notify_kill_switch(self.risk_manager.kill_switch.halt_reason())
             return
 
         self.risk_manager.register_execution_success()
@@ -113,7 +115,9 @@ class ExitMonitor:
         if position.status == PositionStatus.CLOSED:
             position.closed_at = now_ts()
             self.accounting.record_position_closed(position)
-            self.risk_manager.register_realized_pnl(position.realized_pnl_sol)
+            newly_tripped = self.risk_manager.register_realized_pnl(position.realized_pnl_sol)
+            if newly_tripped:
+                self.alerter.notify_kill_switch(self.risk_manager.kill_switch.halt_reason())
 
     async def run_forever(self, open_positions: OpenPositionsProvider, stop_event: Optional[asyncio.Event] = None) -> None:
         loop = asyncio.get_running_loop()

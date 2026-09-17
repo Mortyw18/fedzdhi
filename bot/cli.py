@@ -27,7 +27,7 @@ def _cmd_daily_report(cfg) -> int:
 
 
 def _cmd_reset_kill_switch(cfg) -> int:
-    ks = KillSwitch(cfg.daily_loss_cap_sol, state_path="data/kill_switch_state.json")
+    ks = KillSwitch(cfg.daily_loss_cap_sol, state_path=cfg.kill_switch_state_path)
     was_halted = ks.is_halted()
     reason = ks.halt_reason()
     ks.reset()

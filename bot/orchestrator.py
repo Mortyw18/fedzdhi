@@ -66,7 +66,7 @@ class Orchestrator:
 
         self.accounting = Accounting(config.db_path, logger=self.logger)
         self.kill_switch = KillSwitch(
-            config.daily_loss_cap_sol, state_path="data/kill_switch_state.json", logger=self.logger
+            config.daily_loss_cap_sol, state_path=config.kill_switch_state_path, logger=self.logger
         )
         self.risk_manager = RiskManager(config, self.kill_switch, logger=self.logger)
         self.alerter = Alerter(config.telegram_bot_token, config.telegram_chat_id, logger=self.logger)
@@ -148,6 +148,7 @@ class Orchestrator:
         self.open_positions: dict[str, Position] = {}
         self._token_decimals_cache: dict[str, int] = {}
         self._ws: Optional[RpcWebSocket] = None
+        self._indexing_skipped_count = 0
         if config.helius_ws_url:
             self._ws = RpcWebSocket(config.helius_ws_url, logger=self.logger)
 
@@ -214,9 +215,11 @@ class Orchestrator:
         try:
             fill = self.execution.buy(candidate.mint, self.config.position_size_sol, candidate.token_decimals)
         except ExecutionFailed as exc:
-            self.risk_manager.register_execution_failure()
+            newly_tripped = self.risk_manager.register_execution_failure()
             self.logger.error("buy failed for %s: %s", candidate.mint, exc)
             self.alerter.notify(f"BUY FAILED {candidate.symbol}: {exc}")
+            if newly_tripped:
+                self.alerter.notify_kill_switch(self.kill_switch.halt_reason())
             return
 
         self.risk_manager.register_execution_success()
@@ -293,12 +296,37 @@ class Orchestrator:
                     )
                 )
 
+    def _indexing_skip_reason(self) -> Optional[str]:
+        """Indexing is the lowest-priority RPC consumer in this bot: it's
+        background learning, not a trade that's waiting on a price. A
+        subscription to an AMM program's logs can be an enormous stream
+        (most swap activity network-wide mentions it, not just our own
+        candidates), so it must never be what pushes RPC usage into the
+        danger zone TokenSafety and ExitMonitor actually depend on.
+
+        Returns a reason string if the current notification should be
+        dropped without ever making an RPC call, or None if it's fine to
+        proceed. Kept as a small, pure, synchronous method so the backoff
+        policy is directly testable without spinning up the async loop.
+        """
+        if self.kill_switch.is_halted():
+            return f"kill switch halted ({self.kill_switch.halt_reason()})"
+        usage = self.rpc.budget.current_usage_pct()
+        if usage >= self.config.indexing_max_rpc_budget_pct:
+            return f"RPC budget usage {usage:.0%} >= indexing ceiling {self.config.indexing_max_rpc_budget_pct:.0%}"
+        return None
+
     async def _index_program_loop(self, program_id: str) -> None:
         if self._ws is None:
             return
         async for notification in self._ws.logs_subscribe(program_id):
             if self.stop_event.is_set():
                 return
+            skip_reason = self._indexing_skip_reason()
+            if skip_reason is not None:
+                self._indexing_skipped_count += 1
+                self.logger.debug("indexing notification dropped: %s", skip_reason)
+                continue
             signature = (notification.get("value") or {}).get("signature")
             if not signature:
                 continue
@@ -313,8 +341,9 @@ class Orchestrator:
                 if tx:
                     self._parse_leader_activity(tx, signature)
             except RpcOutage:
-                self.kill_switch.set_rpc_outage(True)
-                self.alerter.notify_kill_switch(self.kill_switch.halt_reason())
+                newly_tripped = self.kill_switch.set_rpc_outage(True)
+                if newly_tripped:
+                    self.alerter.notify_kill_switch(self.kill_switch.halt_reason())
 
     # ------------------------------------------------------------------
     # daily/weekly reporting
@@ -326,6 +355,20 @@ class Orchestrator:
             report = self.accounting.daily_report()
             self.logger.info("daily_report", extra={"fields": report})
             self.alerter.notify_rejection_digest(report)
+
+    async def _rpc_budget_snapshot_loop(self) -> None:
+        """Persists RpcGateway's live call stats periodically so the RPC
+        budget audit shows up in `--daily-report` even though that one-shot
+        command never starts a real gateway -- it only ever reads this
+        history back out of SQLite."""
+        while not self.stop_event.is_set():
+            await asyncio.sleep(self.config.rpc_budget_snapshot_interval_s)
+            stats = self.rpc.get_call_stats()
+            self.accounting.record_rpc_snapshot(stats)
+            self.logger.debug(
+                "rpc_budget_snapshot",
+                extra={"fields": {**stats, "indexing_skipped": self._indexing_skipped_count}},
+            )
 
     def status_text(self) -> str:
         if self.config.observe_only:
@@ -360,6 +403,7 @@ class Orchestrator:
             asyncio.create_task(self.signal_engine.run_dexscreener_loop(self._on_candidate, self.stop_event)),
             asyncio.create_task(self.signal_engine.run_pumpfun_loop(self._on_candidate, self.stop_event)),
             asyncio.create_task(self._daily_report_loop()),
+            asyncio.create_task(self._rpc_budget_snapshot_loop()),
             asyncio.create_task(self.alerter.run_command_loop(self.status_text, self._request_stop, self.stop_event)),
         ]
         if not self.config.observe_only:

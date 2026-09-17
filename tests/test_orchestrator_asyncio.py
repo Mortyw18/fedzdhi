@@ -35,6 +35,7 @@ def _build_orchestrator(tmp_path) -> Orchestrator:
         helius_rpc_url="https://example.invalid/rpc",  # no helius_ws_url -> no WS indexing tasks
         db_path=":memory:",
         log_dir=str(tmp_path / "logs"),
+        kill_switch_state_path=str(tmp_path / "kill_switch_state.json"),
         dexscreener_poll_interval_s=0.01,
     )
     cfg.validate()

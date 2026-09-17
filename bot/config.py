@@ -77,7 +77,11 @@ class Config:
     max_acceptable_price_impact_pct: float = 0.05
 
     # --- signal engine ---
-    dexscreener_poll_interval_s: float = 45.0
+    # DexScreener itself isn't the RPC budget concern, but every candidate it
+    # surfaces triggers a full TokenSafety pass against Helius -- a slower
+    # poll interval is a real lever on RPC load, not just DexScreener's own
+    # rate limit. 60s is the top of the spec's 30-60s range.
+    dexscreener_poll_interval_s: float = 60.0
     min_pool_liquidity_usd: float = 15_000.0
     max_pool_liquidity_usd: float = 400_000.0
     max_pool_age_s: float = 72 * 3600.0
@@ -111,6 +115,16 @@ class Config:
     helius_ws_url: str = ""
     failover_rpc_url: str = ""
     rpc_rate_limit_per_10s: int = 100  # Helius free tier budget, conservative
+    # InsiderRadar's WebSocket indexing is the lowest-priority RPC consumer --
+    # TokenSafety and ExitMonitor must never be starved by background
+    # indexing. Once the gateway's own rolling budget usage crosses this
+    # ceiling, the indexer stops issuing getTransaction calls for new
+    # notifications until usage drops back down (see Orchestrator).
+    indexing_max_rpc_budget_pct: float = 0.50
+    # How often the running bot snapshots RpcGateway's call stats into
+    # Accounting, so `--daily-report` can show the RPC budget after the
+    # fact even though that one-shot command never starts a live gateway.
+    rpc_budget_snapshot_interval_s: float = 60.0
 
     # --- telegram ---
     telegram_bot_token: str = ""
@@ -122,6 +136,10 @@ class Config:
     # --- misc ---
     db_path: str = "data/bot.db"
     log_dir: str = "logs"
+    # Deliberately a fixed path, not derived from a run ID: --reset-kill-switch
+    # is a separate process invocation and must find the same file the
+    # running bot is using.
+    kill_switch_state_path: str = "data/kill_switch_state.json"
 
     def validate(self) -> None:
         """Raise ConfigError with a printed explanation for any reckless value.

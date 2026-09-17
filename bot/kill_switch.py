@@ -81,42 +81,60 @@ class KillSwitch:
     # recording
     # ------------------------------------------------------------------
 
-    def record_pnl(self, pnl_sol: float) -> None:
+    def record_pnl(self, pnl_sol: float) -> bool:
+        """Returns True only if THIS call newly tripped the halt (a state
+        change), False if it didn't trip anything or the switch was already
+        halted. Callers use this to decide whether to alert -- see
+        Orchestrator's RpcOutage handler for why that distinction matters:
+        without it, every subsequent event re-announces a halt that already
+        happened, which is exactly the alert spam this return value exists
+        to prevent."""
         self._roll_day_if_needed()
         self.state.daily_pnl_sol += pnl_sol
+        newly_tripped = False
         if self.state.daily_pnl_sol <= -abs(self.daily_loss_cap_sol):
-            self._halt(
+            newly_tripped = self._halt(
                 f"daily loss cap breached: {self.state.daily_pnl_sol:.4f} SOL "
                 f"<= -{self.daily_loss_cap_sol:.4f} SOL"
             )
         self._save()
+        return newly_tripped
 
     def record_buy(self) -> None:
         self._roll_day_if_needed()
         self.state.buys_today += 1
         self._save()
 
-    def record_execution_failure(self) -> None:
+    def record_execution_failure(self) -> bool:
+        """Returns True only on the transition into halted -- see record_pnl."""
         self.state.consecutive_failures += 1
+        newly_tripped = False
         if self.state.consecutive_failures >= self.max_consecutive_failures:
-            self._halt(f"{self.state.consecutive_failures} consecutive execution failures")
+            newly_tripped = self._halt(f"{self.state.consecutive_failures} consecutive execution failures")
         self._save()
+        return newly_tripped
 
     def record_execution_success(self) -> None:
         self.state.consecutive_failures = 0
         self._save()
 
-    def set_rpc_outage(self, active: bool) -> None:
+    def set_rpc_outage(self, active: bool) -> bool:
+        """Returns True only on the transition into halted -- see record_pnl."""
         self.state.rpc_outage = active
+        newly_tripped = False
         if active:
-            self._halt("RPC outage: can't see prices, can't safely manage exits")
+            newly_tripped = self._halt("RPC outage: can't see prices, can't safely manage exits")
         self._save()
+        return newly_tripped
 
-    def _halt(self, reason: str) -> None:
-        if not self.state.halted:
+    def _halt(self, reason: str) -> bool:
+        """Returns True if this call is what newly tripped the halt."""
+        newly_tripped = not self.state.halted
+        if newly_tripped:
             self.logger.error("kill_switch_tripped", extra={"fields": {"reason": reason}})
         self.state.halted = True
         self.state.halt_reason = reason
+        return newly_tripped
 
     # ------------------------------------------------------------------
     # queries / manual reset

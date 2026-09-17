@@ -46,6 +46,7 @@ def _observe_only_orchestrator(tmp_path, safety_passed: bool = True) -> Orchestr
         helius_rpc_url="https://example.invalid/rpc",
         db_path=":memory:",
         log_dir=str(tmp_path / "logs"),
+        kill_switch_state_path=str(tmp_path / "kill_switch_state.json"),
     )
     cfg.validate()  # must not raise: paper + observe_only + an RPC url is a valid combination
     orch = Orchestrator(cfg)

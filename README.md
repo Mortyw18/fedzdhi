@@ -342,8 +342,16 @@ flips to live mode on its own.
   object per line, written to `logs/memebot.jsonl`. Every pipeline stage
   can be wrapped in `stage_timer` for per-stage latency instrumentation.
 - `RpcGateway` tracks its own request budget against the configured
-  rate limit and alerts (via `Alerter`) at 70% utilization, before
-  Helius starts returning 429s.
+  rate limit and alerts (via `Alerter`) once at 70% utilization -- the
+  alert latches (won't re-fire on jitter around the threshold) and only
+  re-arms once usage drops back below 40%. On an actual 429, the gateway
+  never retries immediately: it sets a shared, exponentially growing
+  cooldown (capped at 60s) that every subsequent call waits out first,
+  which is what stops a rate-limit episode from spiraling. See
+  "The free tier is a design constraint" in `COSTS.md` for the full
+  picture, including how `TokenSafety` and `InsiderRadar`'s indexing
+  keep their own RPC usage bounded, and how `--daily-report` surfaces
+  calls-per-minute and peak budget usage after the fact.
 
 ---
 
