@@ -1,0 +1,48 @@
+{
+  "pairs": [
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "PairGoodTrend11111111111111111111111111111",
+      "baseToken": {"address": "GoodTrendMint111111111111111111111111111111", "symbol": "GOOD"},
+      "liquidity": {"usd": 80000},
+      "volume": {"m5": 24000, "h1": 120000},
+      "txns": {"m5": {"buys": 40, "sells": 15}},
+      "priceUsd": "0.00042",
+      "pairCreatedAtSecondsAgo": 3600
+    },
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "PairTooIlliquid1111111111111111111111111111",
+      "baseToken": {"address": "TooIlliquidMint11111111111111111111111111111", "symbol": "DUST"},
+      "liquidity": {"usd": 500},
+      "volume": {"m5": 100, "h1": 400},
+      "txns": {"m5": {"buys": 3, "sells": 2}},
+      "priceUsd": "0.0000001",
+      "pairCreatedAtSecondsAgo": 3600
+    },
+    {
+      "chainId": "solana",
+      "dexId": "raydium",
+      "pairAddress": "PairSellHeavy1111111111111111111111111111111",
+      "baseToken": {"address": "SellHeavyMint1111111111111111111111111111111", "symbol": "DUMP"},
+      "liquidity": {"usd": 60000},
+      "volume": {"m5": 30000, "h1": 90000},
+      "txns": {"m5": {"buys": 10, "sells": 40}},
+      "priceUsd": "0.001",
+      "pairCreatedAtSecondsAgo": 3600
+    },
+    {
+      "chainId": "ethereum",
+      "dexId": "uniswap",
+      "pairAddress": "NotSolana11111111111111111111111111111111111",
+      "baseToken": {"address": "0xdeadbeef", "symbol": "ETH_TOKEN"},
+      "liquidity": {"usd": 80000},
+      "volume": {"m5": 24000, "h1": 120000},
+      "txns": {"m5": {"buys": 40, "sells": 15}},
+      "priceUsd": "1.0",
+      "pairCreatedAtSecondsAgo": 3600
+    }
+  ]
+}
