@@ -55,7 +55,14 @@ class Orchestrator:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.logger = setup_logging(config.log_dir)
-        self.stop_event = asyncio.Event()
+        # Deliberately NOT constructed here: asyncio.Event() must be created
+        # while its target loop is running (Orchestrator() is called from
+        # cli.main() *before* asyncio.run() starts one). Creating it here
+        # binds it to whatever implicit loop exists at that moment -- which,
+        # on Python < 3.10, may not be the loop asyncio.run() later creates,
+        # and awaiting it then raises "Task got a Future attached to a
+        # different loop". It's set for real at the top of run().
+        self.stop_event: Optional[asyncio.Event] = None
 
         self.accounting = Accounting(config.db_path, logger=self.logger)
         self.kill_switch = KillSwitch(
@@ -86,6 +93,7 @@ class Orchestrator:
             min_volume_liquidity_ratio=config.min_volume_liquidity_ratio,
             min_buy_sell_ratio=config.min_buy_sell_ratio,
             dexscreener_poll_interval_s=config.dexscreener_poll_interval_s,
+            pumpfun_max_consecutive_failures=config.pumpfun_max_consecutive_failures,
             logger=self.logger,
         )
         self.insider_radar = InsiderRadar(
@@ -295,7 +303,7 @@ class Orchestrator:
             if not signature:
                 continue
             try:
-                tx = await asyncio.get_event_loop().run_in_executor(
+                tx = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self.rpc.call(
                         "getTransaction",
@@ -338,6 +346,12 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        # Created here, not in __init__: this is the first point at which we
+        # are guaranteed to be running inside the loop that owns it for the
+        # rest of the process's life (see the comment on self.stop_event's
+        # declaration in __init__).
+        self.stop_event = asyncio.Event()
+
         mode_label = "observe-only" if self.config.observe_only else self.config.mode.value
         self.logger.info("orchestrator_start", extra={"fields": {"mode": mode_label}})
         self.alerter.notify(f"memebot starting in {mode_label} mode")

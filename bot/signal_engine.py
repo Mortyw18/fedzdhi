@@ -39,6 +39,7 @@ class SignalEngine:
         min_buy_sell_ratio: float,
         dexscreener_poll_interval_s: float = 45.0,
         pumpfun_poll_interval_s: float = 20.0,
+        pumpfun_max_consecutive_failures: int = 5,
         dexscreener_query: str = "solana",
         session: Optional[requests.Session] = None,
         logger: Optional[logging.Logger] = None,
@@ -50,10 +51,21 @@ class SignalEngine:
         self.min_buy_sell_ratio = min_buy_sell_ratio
         self.dexscreener_poll_interval_s = dexscreener_poll_interval_s
         self.pumpfun_poll_interval_s = pumpfun_poll_interval_s
+        self.pumpfun_max_consecutive_failures = pumpfun_max_consecutive_failures
         self.dexscreener_query = dexscreener_query
         self.session = session or requests.Session()
         self.logger = logger or logging.getLogger("memebot.signal_engine")
         self._seen_mints: set[str] = set()
+
+        # pump.fun's API is unofficial, unauthenticated, and has been known
+        # to sit behind Cloudflare returning 5xx (530 = origin unreachable)
+        # for scripted clients for extended periods. A pump.fun outage must
+        # never take down DexScreener polling, InsiderRadar, or the rest of
+        # the bot -- so after enough consecutive failures we stop polling it
+        # for this run (one clear log line) instead of hammering a dead
+        # endpoint on every cycle forever.
+        self.pumpfun_consecutive_failures = 0
+        self.pumpfun_disabled = False
 
     # ------------------------------------------------------------------
     # DexScreener
@@ -179,11 +191,27 @@ class SignalEngine:
         )
 
     def poll_pumpfun_once(self) -> list[Candidate]:
+        if self.pumpfun_disabled:
+            return []
         try:
             raw_coins = self.fetch_pumpfun_new_coins()
-        except (requests.RequestException, ValueError) as exc:
-            self.logger.warning("pump.fun poll failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - unofficial API, any failure shape must degrade, never crash
+            self.pumpfun_consecutive_failures += 1
+            self.logger.warning(
+                "pump.fun poll failed (%d/%d consecutive failures): %s",
+                self.pumpfun_consecutive_failures,
+                self.pumpfun_max_consecutive_failures,
+                exc,
+            )
+            if self.pumpfun_consecutive_failures >= self.pumpfun_max_consecutive_failures:
+                self.pumpfun_disabled = True
+                self.logger.error(
+                    "pump.fun source disabled for the rest of this run after %d consecutive failures -- "
+                    "DexScreener signals and InsiderRadar indexing are unaffected. Restart the bot to retry.",
+                    self.pumpfun_consecutive_failures,
+                )
             return []
+        self.pumpfun_consecutive_failures = 0
         out: list[Candidate] = []
         for raw in raw_coins:
             candidate = self.parse_pumpfun_coin(raw)
@@ -203,7 +231,7 @@ class SignalEngine:
             await result
 
     async def run_dexscreener_loop(self, callback: CandidateCallback, stop_event: Optional[asyncio.Event] = None) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while stop_event is None or not stop_event.is_set():
             candidates = await loop.run_in_executor(None, self.poll_dexscreener_once)
             for c in candidates:
@@ -211,7 +239,7 @@ class SignalEngine:
             await asyncio.sleep(self.dexscreener_poll_interval_s)
 
     async def run_pumpfun_loop(self, callback: CandidateCallback, stop_event: Optional[asyncio.Event] = None) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while stop_event is None or not stop_event.is_set():
             candidates = await loop.run_in_executor(None, self.poll_pumpfun_once)
             for c in candidates:
