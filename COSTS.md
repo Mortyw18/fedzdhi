@@ -35,31 +35,36 @@ A position that uses the take-profit ladder generates a **third** fill
 stop), so a "successful" trade can cost more in fees than a simple
 stop-out, not less.
 
-## Projected burn at 5 trades/day
+## Projected burn at 3 trades/day
 
-`max_buys_per_day` defaults to 5. Assume roughly 1.4 sell fills per buy
+`max_buys_per_day` defaults to 3. Assume roughly 1.4 sell fills per buy
 on average (some positions hard-stop in a single fill, some ladder into
 two):
 
 | Period | Buys | Est. sell fills | Total fills | Fee cost (network + priority only) |
 |---|---|---|---|---|
-| 1 day | 5 | 7 | 12 | ~0.006 - 0.018 SOL |
-| 1 week | 35 | 49 | 84 | ~0.042 - 0.126 SOL |
-| 1 month (30d) | 150 | 210 | 360 | ~0.18 - 0.54 SOL |
+| 1 day | 3 | 4 | 7 | ~0.0035 - 0.0105 SOL |
+| 1 week | 21 | 29 | 50 | ~0.025 - 0.075 SOL |
+| 1 month (30d) | 90 | 126 | 216 | ~0.108 - 0.324 SOL |
 
-**This is the number that matters most in this file: at 5 trades/day,
-fees alone over a month can exceed the entire 0.2 SOL bankroll**, before
-accounting for slippage on top of network/priority fees, and completely
-independent of whether the underlying trades are winners or losers. This
-is not a hypothetical -- it's the same arithmetic behind the "+25% to
-breakeven" figure in README.md, extended across a month of trading
-frequency. It's also exactly why `max_buys_per_day=5` and
-`daily_loss_cap_sol=0.04` exist as hard caps rather than suggestions,
-and why M3's 14-day paper gate reports PnL **after** fees and the paper
-haircut, not before.
+**This is the number that matters most in this file: at 3 trades/day,
+fees alone over a month range from roughly half the entire 0.2 SOL
+bankroll to more than it**, before accounting for slippage on top of
+network/priority fees, and completely independent of whether the
+underlying trades are winners or losers. This is not a hypothetical --
+it's the same arithmetic behind the "+25% to breakeven" figure in
+README.md, extended across a month of trading frequency. It's also
+exactly why `max_buys_per_day=3` and `daily_loss_cap_sol=0.04` exist as
+hard caps rather than suggestions, and why M3's 14-day paper gate
+reports PnL **after** fees and the paper haircut, not before.
+
+(`max_buys_per_day` was lowered from an earlier default of 5 specifically
+to cut this monthly fee burn -- at 5 trades/day the same arithmetic put
+the high end of the range at ~0.54 SOL/month, more than 2.5x the entire
+bankroll in fees alone.)
 
 RPC costs do not scale with trade count in any way that matters here --
-even at 5 trades/day, request volume for quoting, safety checks, and
+even at 3 trades/day, request volume for quoting, safety checks, and
 exit polling stays comfortably inside Helius's free tier. The dominant
 cost, by a wide margin, is Solana network + priority fees, not
 infrastructure.

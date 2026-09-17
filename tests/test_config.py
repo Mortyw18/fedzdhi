@@ -3,10 +3,15 @@ from __future__ import annotations
 import pytest
 
 from bot.config import Config, ConfigError
+from bot.models import Mode
 
 
 def test_default_config_is_valid():
     Config().validate()  # must not raise
+
+
+def test_default_max_buys_per_day_is_three():
+    assert Config().max_buys_per_day == 3
 
 
 def test_position_over_hard_ceiling_rejected():
@@ -61,3 +66,21 @@ def test_ruin_table_contains_key_numbers():
     assert "0.200" in table
     assert "0.050" in table
     assert "RUIN TABLE" in table
+
+
+def test_observe_only_requires_rpc_configured():
+    with pytest.raises(ConfigError):
+        Config(observe_only=True).validate()
+
+
+def test_observe_only_with_helius_key_is_valid():
+    Config(observe_only=True, helius_api_key="test-key").validate()
+
+
+def test_observe_only_with_rpc_url_is_valid():
+    Config(observe_only=True, helius_rpc_url="https://example.invalid/rpc").validate()
+
+
+def test_observe_only_cannot_combine_with_live():
+    with pytest.raises(ConfigError):
+        Config(mode=Mode.LIVE, observe_only=True, helius_api_key="test-key").validate()

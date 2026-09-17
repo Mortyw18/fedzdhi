@@ -136,7 +136,7 @@ why 0.05 SOL is the hard default and 0.1 SOL requires both
 | Alerter | `bot/alerter.py` | Telegram notifications, `/status` and `/stop` |
 | KillSwitch | `bot/kill_switch.py` | Daily loss cap, consecutive-failure cap, RPC-outage halt, manual reset only |
 | Orchestrator | `bot/orchestrator.py` | Wires everything into one asyncio process |
-| CLI | `bot/cli.py`, `run.py` | Entry point, confirmations, `--sweep`, `--daily-report`, `--reset-kill-switch` |
+| CLI | `bot/cli.py`, `run.py` | Entry point, confirmations, `--observe-only`, `--sweep`, `--daily-report`, `--reset-kill-switch` |
 
 There is exactly one path from "candidate token" to "open position":
 `Orchestrator.evaluate_candidate` -> `TokenSafety.evaluate` ->
@@ -161,12 +161,130 @@ Run the test suite (no network required):
 pytest
 ```
 
+### 3.1 Setting up your `.env`, step by step
+
+#### Helius API key (RPC access)
+
+1. Go to https://dev.helius.xyz and sign up (free tier).
+2. Create a project in the dashboard; copy its API key.
+3. Paste it into `.env`:
+   ```
+   HELIUS_API_KEY=<your key>
+   ```
+   `load_config_from_env` (`bot/config.py`) derives both
+   `HELIUS_RPC_URL` and `HELIUS_WS_URL` from this key automatically. You
+   only need to set `HELIUS_RPC_URL`/`HELIUS_WS_URL` directly if you're
+   using a different provider (QuickNode, a paid Helius plan with a
+   custom endpoint, etc.) instead of `HELIUS_API_KEY`.
+
+This is the one variable both `--observe-only` and normal paper-mode
+runs actually need -- without it, `TokenSafety` has no RPC to check
+mint authorities, holder concentration, or run honeypot simulations
+against, and `Config.validate()` will refuse to start `--observe-only`
+without it (paper/live trading runs will also fail at the first
+on-chain call).
+
+#### Generating a dedicated bot wallet (only needed for `--live` / `--sweep`)
+
+**Never use your main wallet's private key.** Generate a fresh,
+dedicated keypair and fund it with only the bankroll you intend to
+trade with.
+
+This codebase deliberately avoids depending on the full
+solana-py/solders SDK (see `bot/solana_wallet.py`), so you can generate
+a compatible keypair with the same primitives the bot itself uses --
+no extra tooling required:
+
+```bash
+python3 -c "
+from nacl.signing import SigningKey
+import base58
+sk = SigningKey.generate()
+secret = bytes(sk) + bytes(sk.verify_key)
+print('SOLANA_PRIVATE_KEY=' + base58.b58encode(secret).decode())
+print('Wallet address (fund this one):', base58.b58encode(bytes(sk.verify_key)).decode())
+"
+```
+
+- Paste the `SOLANA_PRIVATE_KEY=...` line into `.env` exactly as printed.
+- Fund the printed **wallet address** (not the private key!) with your
+  intended bankroll -- 0.2 SOL is the default this entire bot is tuned
+  around (see the ruin table above) -- plus roughly another 0.02 SOL to
+  cover network and priority fees, since SOL itself pays for its own
+  transactions.
+- If you'd rather use the official Solana CLI:
+  `solana-keygen new --outfile bot-wallet.json --no-bip39-passphrase`,
+  then paste the resulting JSON array (e.g. `[12,45,...]`) directly into
+  `SOLANA_PRIVATE_KEY` -- `bot/solana_wallet.py` accepts either a
+  base58 string or a JSON array of 64 bytes.
+- `SOLANA_PRIVATE_KEY` is read once at process start, is never logged,
+  and `repr(Wallet)` deliberately omits it -- see
+  `bot/solana_wallet.py::Wallet.__repr__` and its test in
+  `tests/test_solana_wallet.py::test_wallet_repr_never_leaks_key_material`.
+- Paper mode and `--observe-only` never read this variable at all --
+  they generate their own disposable, unfunded keypair internally
+  purely to satisfy Jupiter's transaction-building API (see
+  `Orchestrator.__init__`), so you can leave it blank until you're
+  ready for M4.
+
+#### Telegram alerts (optional but recommended)
+
+1. Message [@BotFather](https://t.me/BotFather) on Telegram, `/newbot`,
+   follow the prompts. It gives you a token.
+2. Set `TELEGRAM_BOT_TOKEN=<that token>` in `.env`.
+3. Send your new bot any message, then visit
+   `https://api.telegram.org/bot<token>/getUpdates` in a browser and
+   read `message.chat.id` from the JSON response.
+4. Set `TELEGRAM_CHAT_ID=<that id>` in `.env`.
+
+Without these two set, `Alerter` is a safe no-op -- every notification
+is still written to the structured logs, it just doesn't reach
+Telegram (`bot/alerter.py::Alerter.enabled`).
+
+#### Every variable in `.env.example`, explained
+
+| Variable | Required? | What it does |
+|---|---|---|
+| `HELIUS_API_KEY` | Recommended | Free-tier Helius key; `HELIUS_RPC_URL`/`HELIUS_WS_URL` are derived from it automatically. |
+| `HELIUS_RPC_URL` | Optional | Overrides the derived HTTP RPC endpoint. Set this instead of `HELIUS_API_KEY` for a different provider or a custom paid endpoint. |
+| `HELIUS_WS_URL` | Optional | Overrides the derived WebSocket endpoint, used by `InsiderRadar`'s on-chain indexing (`logsSubscribe`). |
+| `FAILOVER_RPC_URL` | Optional | A second RPC endpoint `RpcGateway` falls back to if the primary fails. Leave blank to run without failover. |
+| `SOLANA_PRIVATE_KEY` | Only for `--live` / `--sweep` | The dedicated bot wallet's secret key (base58 or JSON array). Never your main wallet, never committed, never logged. |
+| `TELEGRAM_BOT_TOKEN` | Optional | Enables Telegram alerts and `/status`, `/stop`. Blank = alerts go to logs only. |
+| `TELEGRAM_CHAT_ID` | Required if `TELEGRAM_BOT_TOKEN` is set | The chat Telegram alerts are sent to. |
+| `BANKROLL_SOL` | Recommended | Feeds the ruin table and the position-size-vs-bankroll checks in `Config.validate()`. Set it to what you actually funded. |
+| `DB_PATH` | Optional | SQLite ledger path. Defaults to `data/bot.db`. |
+
+Once `.env` is filled in, sanity-check that it loads correctly without
+starting any run that touches RPC or a wallet:
+
+```bash
+python run.py --daily-report
+```
+
 ## 4. Running
 
-Paper mode is the default. It runs the identical pipeline and risk
-rules as live mode; only `ExecutionEngine` is swapped for a simulator
-that fills against real Jupiter quotes with a 2% haircut baked in
-(quotes are always a little optimistic about what you'd actually get).
+**M2 (observe-only) comes first.** `--observe-only` runs SignalEngine,
+TokenSafety, and InsiderRadar's indexing against live data and logs
+every candidate and safety verdict, but never calls
+`ExecutionEngine.buy` -- not even a paper fill. No wallet is required.
+This is the mode to run for the 48h M2 gate, before any capital
+(paper or real) is ever put at risk:
+
+```bash
+python run.py --observe-only                   # logs candidates + safety verdicts, indexes InsiderRadar, never trades
+python run.py --observe-only --daily-report     # (in a second terminal) check the rejection-reason breakdown so far
+```
+
+Cannot be combined with `--live` -- `Config.validate()` refuses that
+combination with an explanation, since observe-only never trades either
+way.
+
+Paper mode is the default once you move past M2. It runs the identical
+pipeline and risk rules as live mode; only `ExecutionEngine` is swapped
+for a simulator that fills against real Jupiter quotes with a 2%
+haircut baked in (quotes are always a little optimistic about what
+you'd actually get).
 
 ```bash
 python run.py                                  # paper mode, 0.05 SOL positions
@@ -202,7 +320,7 @@ pm2 logs memebot
 | Milestone | What | Gate to proceed |
 |---|---|---|
 | **M1** | All 10 modules implemented, full test suite passing offline (`pytest`, zero network) | Green suite, no placeholders |
-| **M2** | 48h OBSERVE-ONLY on live data: candidates + safety verdicts logged, InsiderRadar begins indexing | Manually review the rejection log -- if almost nothing is rejected, thresholds are wrong (the daily report says so explicitly above a 70% pass rate) |
+| **M2** | 48h `python run.py --observe-only`: candidates + safety verdicts logged against live data, InsiderRadar begins indexing, zero trades placed | Manually review the rejection log (`--daily-report`) -- if almost nothing is rejected, thresholds are wrong (the daily report says so explicitly above a 70% pass rate) |
 | **M3** | 14 days PAPER, unattended, laptop caffeinated, including copy-trade paper results once the leaderboard is live | Zero crashes, complete daily reports every day, honest PnL after fees + haircut (even if negative -- see `HONESTY.md`) |
 | **M4** | LIVE at HALF size (0.025 SOL/position via `--position-size 0.025`), kill switch armed | 2 weeks live, net PnL >= 0 before raising to 0.05. Raising to 0.10 (only if ever) requires another 2 weeks positive AND the operator accepting the ruin table in writing |
 

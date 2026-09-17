@@ -92,6 +92,14 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    if cfg.observe_only:
+        print(
+            "OBSERVE-ONLY mode (M2): logging candidates, safety verdicts, and InsiderRadar\n"
+            "indexing against live data. ExecutionEngine.buy is never called -- no trade will\n"
+            "be placed, live or paper. No wallet is required. Review rejections with\n"
+            "`python run.py --daily-report` or the JSON logs in logs/memebot.jsonl."
+        )
+
     confirm_startup(cfg, args)
 
     from bot.orchestrator import Orchestrator

@@ -52,10 +52,14 @@ class Config:
 
     # --- mode ---
     mode: Mode = Mode.PAPER
+    # Observe-only (M2): runs SignalEngine + TokenSafety + InsiderRadar indexing
+    # against live data and logs every candidate/verdict, but never calls
+    # ExecutionEngine.buy -- not even a paper fill. See Orchestrator.evaluate_candidate.
+    observe_only: bool = False
 
     # --- risk manager ---
     max_concurrent_positions: int = 3
-    max_buys_per_day: int = 5
+    max_buys_per_day: int = 3
     hard_stop_pct: float = -0.35
     ladder_tp1_trigger_pct: float = 1.00      # +100%
     ladder_tp1_sell_fraction: float = 0.50    # sell 50%
@@ -182,6 +186,18 @@ class Config:
         if self.mode == Mode.LIVE and not (self.helius_api_key or self.helius_rpc_url):
             problems.append("LIVE mode requires HELIUS_API_KEY or HELIUS_RPC_URL to be set.")
 
+        if self.observe_only and self.mode == Mode.LIVE:
+            problems.append(
+                "observe_only cannot be combined with LIVE mode -- observe-only never trades, live or "
+                "paper, so there is nothing for a live wallet to do. Drop --live to run --observe-only."
+            )
+
+        if self.observe_only and not (self.helius_api_key or self.helius_rpc_url):
+            problems.append(
+                "observe_only mode is meant to run against live on-chain data (that's the point of the "
+                "M2 gate), which needs HELIUS_API_KEY or HELIUS_RPC_URL. Set one in .env."
+            )
+
         if problems:
             explanation = "\n".join(f"  - {p}" for p in problems)
             raise ConfigError(
@@ -251,6 +267,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--live", action="store_true", help="Trade with real funds. Requires typed confirmation.")
     p.add_argument(
+        "--observe-only",
+        action="store_true",
+        help="M2 mode: log candidates, safety verdicts, and InsiderRadar indexing against live data. "
+        "Never places a trade, live or paper. Cannot be combined with --live.",
+    )
+    p.add_argument(
         "--allow-heavy-sizing",
         action="store_true",
         help=f"Allow {HEAVY_POSITION_SIZE_SOL} SOL positions instead of the {DEFAULT_POSITION_SIZE_SOL} default. "
@@ -276,6 +298,7 @@ def apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.position_size_sol = HEAVY_POSITION_SIZE_SOL
     cfg.allow_heavy_sizing = args.allow_heavy_sizing
     cfg.mode = Mode.LIVE if args.live else Mode.PAPER
+    cfg.observe_only = args.observe_only
     return cfg
 
 

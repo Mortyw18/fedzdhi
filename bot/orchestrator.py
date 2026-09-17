@@ -168,10 +168,14 @@ class Orchestrator:
     def evaluate_candidate(self, candidate: Candidate) -> None:
         self.accounting.record_candidate(candidate)
 
-        allowed, reason = self.risk_manager.can_open_position(candidate.mint, self._open_positions_list())
-        if not allowed:
-            self.logger.info("candidate skipped (risk gate): %s -- %s", candidate.mint, reason)
-            return
+        # Observe-only (M2) skips the risk gate entirely: we want a safety
+        # verdict logged for every candidate, not a subset filtered by
+        # concurrency/day caps that only matter once we're actually trading.
+        if not self.config.observe_only:
+            allowed, reason = self.risk_manager.can_open_position(candidate.mint, self._open_positions_list())
+            if not allowed:
+                self.logger.info("candidate skipped (risk gate): %s -- %s", candidate.mint, reason)
+                return
 
         candidate.token_decimals = self._get_token_decimals(candidate.mint)
         first_buyers = self.insider_radar.get_first_buyers(candidate.mint)
@@ -184,6 +188,15 @@ class Orchestrator:
             distinct_token_lookup=self.insider_radar.distinct_token_count,
         )
         self.accounting.record_safety_verdict(verdict)
+
+        if self.config.observe_only:
+            # The entire point of M2: log the verdict, place no trade, live or paper.
+            self.logger.info(
+                "observe_only_verdict",
+                extra={"fields": {"mint": candidate.mint, "passed": verdict.passed, "source": candidate.source.value}},
+            )
+            return
+
         if not verdict.passed:
             return
 
@@ -307,6 +320,8 @@ class Orchestrator:
             self.alerter.notify_rejection_digest(report)
 
     def status_text(self) -> str:
+        if self.config.observe_only:
+            return "mode=observe-only (no trades placed, live or paper) -- see --daily-report for verdict stats"
         open_count = len(self.open_positions)
         return (
             f"mode={self.config.mode.value} open_positions={open_count}/{self.config.max_concurrent_positions} "
@@ -323,16 +338,21 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        self.logger.info("orchestrator_start", extra={"fields": {"mode": self.config.mode.value}})
-        self.alerter.notify(f"memebot starting in {self.config.mode.value} mode")
+        mode_label = "observe-only" if self.config.observe_only else self.config.mode.value
+        self.logger.info("orchestrator_start", extra={"fields": {"mode": mode_label}})
+        self.alerter.notify(f"memebot starting in {mode_label} mode")
 
         tasks = [
             asyncio.create_task(self.signal_engine.run_dexscreener_loop(self._on_candidate, self.stop_event)),
             asyncio.create_task(self.signal_engine.run_pumpfun_loop(self._on_candidate, self.stop_event)),
-            asyncio.create_task(self.exit_monitor.run_forever(self._open_positions_list, self.stop_event)),
             asyncio.create_task(self._daily_report_loop()),
             asyncio.create_task(self.alerter.run_command_loop(self.status_text, self._request_stop, self.stop_event)),
         ]
+        if not self.config.observe_only:
+            # No position can ever exist in observe-only mode, so there is
+            # nothing for ExitMonitor to poll -- skip it rather than spend
+            # RPC/Jupiter budget checking an always-empty list.
+            tasks.append(asyncio.create_task(self.exit_monitor.run_forever(self._open_positions_list, self.stop_event)))
         if self._ws is not None:
             for program_id in INDEXED_PROGRAM_IDS:
                 tasks.append(asyncio.create_task(self._index_program_loop(program_id)))
