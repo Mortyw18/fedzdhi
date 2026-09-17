@@ -83,6 +83,10 @@ class Config:
     max_pool_age_s: float = 72 * 3600.0
     min_volume_liquidity_ratio: float = 0.20
     min_buy_sell_ratio: float = 1.5
+    # pump.fun's API is unofficial and known to have extended outages (e.g.
+    # Cloudflare 530s). After this many consecutive poll failures, SignalEngine
+    # stops polling it for the rest of the run rather than retrying forever.
+    pumpfun_max_consecutive_failures: int = 5
 
     # --- insider radar ---
     insider_first_buyers_n: int = 50

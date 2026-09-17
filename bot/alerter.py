@@ -92,7 +92,17 @@ class Alerter:
         data = resp.json()
         return data.get("result", [])
 
-    def poll_commands_once(self, on_status: StatusCallback, on_stop: StopCallback) -> None:
+    def poll_commands_once(
+        self,
+        on_status: StatusCallback,
+        on_stop: StopCallback,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        """Runs inside a worker thread (see run_command_loop's run_in_executor),
+        so there is no running event loop in this thread to schedule onto --
+        `loop` is the real loop, captured by the caller while it was still
+        running, and coroutines are handed to it via run_coroutine_threadsafe.
+        """
         if not self.enabled:
             return
         try:
@@ -109,7 +119,10 @@ class Alerter:
             elif text == "/stop":
                 result = on_stop()
                 if asyncio.iscoroutine(result):
-                    asyncio.get_event_loop().create_task(result)
+                    if loop is not None:
+                        asyncio.run_coroutine_threadsafe(result, loop)
+                    else:
+                        result.close()  # nowhere to schedule it -- avoid an "unawaited coroutine" warning
                 self.notify("Stop requested. Shutting down after current cycle.")
 
     async def run_command_loop(
@@ -117,6 +130,6 @@ class Alerter:
     ) -> None:
         if not self.enabled:
             return
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while stop_event is None or not stop_event.is_set():
-            await loop.run_in_executor(None, self.poll_commands_once, on_status, on_stop)
+            await loop.run_in_executor(None, self.poll_commands_once, on_status, on_stop, loop)

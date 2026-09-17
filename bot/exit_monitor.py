@@ -116,7 +116,7 @@ class ExitMonitor:
             self.risk_manager.register_realized_pnl(position.realized_pnl_sol)
 
     async def run_forever(self, open_positions: OpenPositionsProvider, stop_event: Optional[asyncio.Event] = None) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while stop_event is None or not stop_event.is_set():
             positions = [p for p in open_positions() if p.status == PositionStatus.OPEN]
             for position in positions:
