@@ -125,7 +125,7 @@ class Orchestrator:
             max_top10_holder_pct=config.max_top10_holder_pct,
             max_acceptable_price_impact_pct=config.max_acceptable_price_impact_pct,
             bundled_launch_min_distinct_tokens=config.bundled_launch_min_distinct_tokens,
-            enable_pumpfun_lookups=config.enable_pumpfun_source,
+            enable_pumpfun_lookups=config.enable_pumpfun_graduation_lookup,
             logger=self.logger,
         )
         self.signal_engine = SignalEngine(
@@ -647,6 +647,21 @@ class Orchestrator:
                         # indexing's own exponential backoff is the sole
                         # authority over how long a failure costs.
                         max_retries=1,
+                        # getTransaction must NEVER be permanently disabled:
+                        # it's the single most fundamental Solana read
+                        # method, not the kind of plan-gated enhanced
+                        # endpoint RpcMethodDisabled exists for, and both
+                        # InsiderRadar indexing and event-driven discovery
+                        # (pool_events) ride on this exact call. A single
+                        # spurious 403 (WAF blip, proxy hiccup, anything
+                        # unrelated to "this method is unavailable")
+                        # permanently disabling it went completely silent
+                        # for a full run in production before this flag
+                        # existed -- indexing's own exponential backoff
+                        # above already handles a genuine sustained outage
+                        # on this call site without needing the disable
+                        # mechanism too.
+                        allow_method_disable=False,
                     ),
                 )
                 self._indexing_rpc_consecutive_failures = 0
@@ -741,7 +756,7 @@ class Orchestrator:
             self.logger.debug("radar_snapshot", extra={"fields": radar_stats})
 
     async def _heartbeat_loop(self) -> None:
-        """One INFO-level line every heartbeat_interval_s (default 10min),
+        """One INFO-level line every heartbeat_interval_s (default 60s),
         unconditionally -- unlike the DEBUG-level snapshot logs above, this
         is meant to be visible in a normal console/log-tail without
         cranking verbosity, specifically so an operator (or a `tail -f` at
@@ -793,6 +808,29 @@ class Orchestrator:
     async def _request_stop(self) -> None:
         self.stop_event.set()
 
+    async def _run_logged(self, coro, name: str) -> None:
+        """Wraps every background task in run()'s list so an unhandled
+        exception is logged loudly (background_task_crashed) instead of
+        silently vanishing.
+
+        Without this, a task that raised mid-run just died -- nothing
+        awaits or checks it again until shutdown's
+        `asyncio.gather(*tasks, return_exceptions=True)`, which collects
+        the exception without ever logging or re-raising it. A crashed
+        loop with zero log output was indistinguishable from "just quiet"
+        purely from the logs, which is exactly the failure mode a silent
+        pool_events/heartbeat outage looked like in production. Every
+        task in run() goes through this now, not just the WS-dependent
+        ones -- the same gap could as easily have hit DexScreener polling
+        or the daily report loop.
+        """
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("background_task_crashed", extra={"fields": {"task": name}})
+
     # ------------------------------------------------------------------
     # main loop
     # ------------------------------------------------------------------
@@ -830,24 +868,52 @@ class Orchestrator:
         self.logger.info("orchestrator_start", extra={"fields": {"mode": mode_label}})
         self.alerter.notify(f"memebot starting in {mode_label} mode")
 
+        def _task(coro, name: str):
+            return asyncio.create_task(self._run_logged(coro, name))
+
         tasks = [
-            asyncio.create_task(self.signal_engine.run_dexscreener_loop(self._on_candidate, self.stop_event)),
-            asyncio.create_task(self.signal_engine.run_pumpfun_loop(self._on_candidate, self.stop_event)),
-            asyncio.create_task(self._daily_report_loop()),
-            asyncio.create_task(self._rpc_budget_snapshot_loop()),
-            asyncio.create_task(self._heartbeat_loop()),
-            asyncio.create_task(self.alerter.run_command_loop(self.status_text, self._request_stop, self.stop_event)),
+            _task(self.signal_engine.run_dexscreener_loop(self._on_candidate, self.stop_event), "dexscreener_loop"),
+            _task(self.signal_engine.run_pumpfun_loop(self._on_candidate, self.stop_event), "pumpfun_loop"),
+            _task(self._daily_report_loop(), "daily_report_loop"),
+            _task(self._rpc_budget_snapshot_loop(), "rpc_budget_snapshot_loop"),
+            _task(self._heartbeat_loop(), "heartbeat_loop"),
+            _task(self.alerter.run_command_loop(self.status_text, self._request_stop, self.stop_event), "alerter_command_loop"),
         ]
         if not self.config.observe_only:
             # No position can ever exist in observe-only mode, so there is
             # nothing for ExitMonitor to poll -- skip it rather than spend
             # RPC/Jupiter budget checking an always-empty list.
-            tasks.append(asyncio.create_task(self.exit_monitor.run_forever(self._open_positions_list, self.stop_event)))
+            tasks.append(_task(self.exit_monitor.run_forever(self._open_positions_list, self.stop_event), "exit_monitor_loop"))
+
         if self._ws is not None:
-            for program_id in INDEXED_PROGRAM_IDS:
-                tasks.append(asyncio.create_task(self._index_program_loop(program_id)))
+            # Loud and explicit, not inferred from silence: this is the
+            # subscription InsiderRadar indexing AND event-driven discovery
+            # (pool_events) both ride on -- if it's not visibly announced
+            # here, "is it even running" was previously answerable only by
+            # waiting for downstream logs that might never come.
+            self.logger.info(
+                "pool_events_subscribing",
+                extra={
+                    "fields": {
+                        "programs": list(INDEXED_PROGRAM_IDS.values()),
+                        "event_driven_discovery": self.config.enable_event_driven_discovery,
+                    }
+                },
+            )
+            for program_id, label in INDEXED_PROGRAM_IDS.items():
+                tasks.append(_task(self._index_program_loop(program_id), f"index_program_loop:{label}"))
             if self.config.enable_event_driven_discovery:
-                tasks.append(asyncio.create_task(self._second_wave_loop()))
+                tasks.append(_task(self._second_wave_loop(), "second_wave_loop"))
+        else:
+            self.logger.warning(
+                "pool_events_inactive_no_ws",
+                extra={
+                    "fields": {
+                        "reason": "HELIUS_WS_URL not configured -- InsiderRadar indexing and event-driven "
+                        "discovery are both inactive; DexScreener polling is the only discovery source running",
+                    }
+                },
+            )
 
         await self.stop_event.wait()
         for t in tasks:

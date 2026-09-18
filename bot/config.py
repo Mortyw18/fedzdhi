@@ -110,9 +110,24 @@ class Config:
     # (5) retries against a known-dead endpoint before giving up for the
     # run. Default now OFF; set ENABLE_PUMPFUN=true in .env to re-enable
     # if pump.fun's API recovers. DexScreener signals and InsiderRadar are
-    # unaffected either way. Also gates TokenSafety's pump.fun graduation
-    # lookup (same API) -- see check_lp_or_graduation in token_safety.py.
+    # unaffected either way. This does NOT gate TokenSafety's graduation
+    # lookup -- see enable_pumpfun_graduation_lookup below.
     enable_pumpfun_source: bool = False
+    # TokenSafety's pump.fun graduation/LP-burn lookup (check_lp_or_graduation
+    # in token_safety.py) used to be tied to enable_pumpfun_source above, so
+    # turning off the dead discovery endpoint also silently made every
+    # pump.fun-origin candidate fail its safety check with "pump.fun lookups
+    # disabled via config -- cannot resolve graduation", even though the
+    # coin-info endpoint the safety check hits is a different URL path than
+    # the coin-list endpoint that's actually 530-blocked (see
+    # fetch_pumpfun_new_coins vs. the graduation lookup in token_safety.py).
+    # Decoupled so a discovery-endpoint outage doesn't false-reject every
+    # pump.fun candidate; set ENABLE_PUMPFUN_GRADUATION_LOOKUP=false only if
+    # the graduation endpoint itself is confirmed dead too. Non-pump.fun
+    # (raw Raydium/DEX-native) launches were never covered by this lookup --
+    # they always reject-on-unverifiable LP status, which is a deliberate
+    # policy, not a bug (see HONESTY.md).
+    enable_pumpfun_graduation_lookup: bool = True
 
     # --- verdict cache ---
     # The same mint gets rediscovered every DexScreener/pump.fun poll cycle
@@ -238,12 +253,18 @@ class Config:
     # Accounting, so `--daily-report` can show the RPC budget after the
     # fact even though that one-shot command never starts a live gateway.
     rpc_budget_snapshot_interval_s: float = 60.0
-    # INFO-level proof-of-life log: poll counts, RPC usage, WS status.
-    # Exists so an unattended overnight run's silence is either "confirmed
-    # quiet and healthy" or "clearly stalled," never ambiguous -- an
-    # earlier run went 10 hours with zero of anything and looked, from the
-    # logs alone, indistinguishable from a healthy quiet night.
-    heartbeat_interval_s: float = 600.0
+    # INFO-level proof-of-life log: poll counts, RPC usage, WS status, and
+    # (as of this run) event-driven-discovery totals (ws_pool_events_seen /
+    # matched / dispatched / rejected, ws_active_connections). Exists so an
+    # unattended overnight run's silence is either "confirmed quiet and
+    # healthy" or "clearly stalled," never ambiguous -- an earlier run went
+    # 10 hours with zero of anything and looked, from the logs alone,
+    # indistinguishable from a healthy quiet night. Was 600s (10min); a
+    # later run went a full hour without a single heartbeat line reaching
+    # the log because nothing had crashed and 600s just hadn't elapsed yet,
+    # so this is now short enough that "no heartbeat in the last couple
+    # minutes" is itself an actionable signal.
+    heartbeat_interval_s: float = 60.0
 
     # --- telegram ---
     telegram_bot_token: str = ""
@@ -406,6 +427,12 @@ def load_config_from_env(env_path: str = ".env") -> Config:
     enable_pumpfun_env = os.environ.get("ENABLE_PUMPFUN")
     if enable_pumpfun_env is not None:
         cfg.enable_pumpfun_source = enable_pumpfun_env.strip().lower() not in ("false", "0", "no")
+    # Separate from ENABLE_PUMPFUN above -- see enable_pumpfun_graduation_lookup's
+    # docstring. Defaults to True (the field default) even when discovery is
+    # off, since the two hit different pump.fun endpoints.
+    enable_pumpfun_grad_env = os.environ.get("ENABLE_PUMPFUN_GRADUATION_LOOKUP")
+    if enable_pumpfun_grad_env is not None:
+        cfg.enable_pumpfun_graduation_lookup = enable_pumpfun_grad_env.strip().lower() not in ("false", "0", "no")
     return cfg
 
 

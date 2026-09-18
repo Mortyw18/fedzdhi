@@ -257,7 +257,8 @@ Telegram (`bot/alerter.py::Alerter.enabled`).
 | `TELEGRAM_CHAT_ID` | Required if `TELEGRAM_BOT_TOKEN` is set | The chat Telegram alerts are sent to. |
 | `BANKROLL_SOL` | Recommended | Feeds the ruin table and the position-size-vs-bankroll checks in `Config.validate()`. Set it to what you actually funded. |
 | `DB_PATH` | Optional | SQLite ledger path. Defaults to `data/bot.db`. |
-| `ENABLE_PUMPFUN` | Optional | Set to `false` to skip pump.fun entirely (its API 530ing for extended stretches is common; this stops the circuit breaker wasting retries on it every restart). DexScreener signals and InsiderRadar are unaffected. Default `true`. |
+| `ENABLE_PUMPFUN` | Optional | Controls pump.fun's coin-*list* discovery poll only (a separate, confirmed-530-blocked endpoint from the one below). Default `false` -- set to `true` to re-enable if pump.fun's API recovers. DexScreener signals and InsiderRadar are unaffected either way. |
+| `ENABLE_PUMPFUN_GRADUATION_LOOKUP` | Optional | Controls TokenSafety's graduation/LP-burn lookup (a different pump.fun coin-*info* endpoint from `ENABLE_PUMPFUN` above -- deliberately independent, so a discovery-endpoint outage doesn't also false-reject every pump.fun candidate's safety check). Default `true`; set to `false` only if the coin-info endpoint itself is confirmed dead too. |
 
 Once `.env` is filled in, sanity-check that it loads correctly without
 starting any run that touches RPC or a wallet:
@@ -392,11 +393,13 @@ the real fix, both times, is that this class of failure is no longer silent:
   `solana_pairs` is consistently 0 (or `passed_filters` stays 0 while
   `rejected_by.pool_age` climbs), that's the thing to change, not the
   liquidity/volume thresholds.
-- Every `heartbeat_interval_s` (default 10min) there's one INFO-level
+- Every `heartbeat_interval_s` (default 60s) there's one INFO-level
   `heartbeat` log: poll counts per source, RPC calls/minute and budget
-  usage, WebSocket active-connection and reconnect counts, and whether
-  the kill switch is halted. Silence between heartbeats now means "still
-  running," not "might have died three hours ago."
+  usage, WebSocket active-connection and reconnect counts, event-driven
+  discovery running totals (pool events seen/matched, second-wave
+  dispatched/expired/rejected), and whether the kill switch is halted.
+  Silence between heartbeats now means "still running," not "might have
+  died three hours ago."
 - `python run.py --radar-stats` shows InsiderRadar's last snapshot
   (wallets indexed, tokens tracked, buy/sell events seen) -- previously
   this state existed only in the running process's memory and the daily

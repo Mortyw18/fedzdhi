@@ -77,6 +77,20 @@ System accounts are). If the daily report's rejection breakdown shows
 in `pump`, that's this limitation, not a bug -- and not something safe to
 work around by trusting an unresolved LP mint on faith.
 
+This pump.fun-side lookup has its own on/off switch,
+`enable_pumpfun_graduation_lookup` (default `true`), deliberately separate
+from `enable_pumpfun_source` (which only controls SignalEngine's discovery
+poll against a different, confirmed-530-blocked pump.fun endpoint).
+Turning discovery off must not also turn this lookup off -- a production
+run once did exactly that under a single shared flag, and every pump.fun
+candidate discovered via DexScreener started failing this check with
+"pump.fun lookups disabled via config," even though the graduation
+endpoint itself was never confirmed dead. If the coin-info endpoint this
+check hits (`PUMPFUN_COIN_INFO_URL` in `token_safety.py`) is ever itself
+confirmed dead, set `ENABLE_PUMPFUN_GRADUATION_LOOKUP=false` deliberately
+-- at which point every pump.fun-origin candidate also fails closed, same
+as the non-pump.fun case above.
+
 ## The likely M3 outcome
 
 If you run this bot honestly for the full 14-day paper period, the most

@@ -48,9 +48,9 @@ class _AlwaysOutageRpc:
         self.budget = _FakeBudget(usage_pct=0.0)
         self._disabled: set[str] = set()
 
-    def call(self, method, params=None, max_retries=None):
+    def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
-        self.calls.append((method, max_retries))
+        self.calls.append((method, max_retries, allow_method_disable))
         raise RpcOutage("simulated outage")
 
     def is_method_disabled(self, method):
@@ -66,7 +66,7 @@ class _AlwaysSucceedsRpc:
         self.budget = _FakeBudget(usage_pct=0.0)
         self._disabled: set[str] = set()
 
-    def call(self, method, params=None, max_retries=None):
+    def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
         return {"meta": {"preTokenBalances": [], "postTokenBalances": []}, "slot": 1, "transaction": {"message": {"accountKeys": []}}}
 
@@ -82,7 +82,7 @@ class _AlwaysMethodDisabledRpc:
         self.call_count = 0
         self.budget = _FakeBudget(usage_pct=0.0)
 
-    def call(self, method, params=None, max_retries=None):
+    def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
         raise RpcMethodDisabled(f"{method} permanently disabled this run")
 
@@ -231,7 +231,26 @@ def test_index_loop_calls_getTransaction_with_max_retries_one(tmp_path):
 
     asyncio.run(drive())
 
-    assert orch.rpc.calls == [("getTransaction", 1)]
+    assert orch.rpc.calls == [("getTransaction", 1, False)]
+
+
+def test_index_loop_never_lets_getTransaction_be_permanently_disabled(tmp_path):
+    """A single spurious 403 permanently disabling getTransaction went
+    completely silent (indexing AND event-driven discovery both ride on
+    this exact call) for a full production run before allow_method_disable
+    existed. Confirms indexing always asks for the exemption."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch._ws = _FakeWs(_notifications(3))
+    orch._indexing_skip_reason = lambda: None  # bypass the backoff gate -- isolates the per-call kwarg, not throttling
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    assert orch.rpc.calls == [("getTransaction", 1, False)] * 3
 
 
 def test_index_loop_logs_method_and_error_on_each_rpc_failure(tmp_path):

@@ -43,15 +43,24 @@ class RpcRateLimited(RpcError):
 class RpcMethodDisabled(RpcOutage):
     """A method looks PERMANENTLY rejected, not transiently failing: a 403
     from the provider, or a JSON-RPC error whose code/message says the
-    method isn't available (e.g. "not supported on this plan"). Retrying
-    this is pointless until the provider config changes -- RpcGateway
-    remembers it for the rest of the process and every subsequent call to
-    that method fails instantly, with zero network I/O, instead of paying
-    a full retry/backoff cycle on every single call forever. Subclasses
-    RpcOutage so existing `except RpcOutage:` call sites keep working
-    unchanged; callers that need to react differently (see Orchestrator's
-    indexing loop, which stops trying the method at all rather than
-    continuing to log a failure every time) can catch this specifically.
+    method isn't available (e.g. "not supported on this plan"), confirmed
+    RpcGateway.method_disable_threshold separate times (not retries of one
+    request -- separate call() invocations) before this is ever raised.
+    A single 403 is deliberately NOT enough: it can just as easily be a
+    transient WAF/proxy block or an unrelated hiccup as a genuine plan
+    restriction, and disabling a method for the rest of the run on one bad
+    response was a real bug in an earlier version of this (getTransaction,
+    an utterly ordinary method no free tier actually restricts, got
+    permanently killed by a single non-representative 403). Once actually
+    confirmed, retrying is pointless until the provider config changes --
+    RpcGateway remembers it for the rest of the process and every
+    subsequent call to that method fails instantly, with zero network I/O.
+    Subclasses RpcOutage so existing `except RpcOutage:` call sites keep
+    working unchanged; callers that need to react differently (see
+    Orchestrator's indexing loop, which stops trying the method at all
+    rather than continuing to log a failure every time) can catch this
+    specifically. See also `call()`'s `allow_method_disable` parameter for
+    opting a call site out of this mechanism entirely.
     """
 
 
@@ -66,11 +75,14 @@ def _looks_like_method_unavailable(error: Any) -> bool:
     method isn't available to you," not an ordinary transient failure?
     JSON-RPC code -32601 is the standard "Method not found." The message
     substrings cover what free-tier providers commonly say instead of a
-    clean error code when a method is plan-gated. False positives here
-    just mean a few retries are skipped early -- not silent -- since
-    rpc_method_disabled is always logged; false negatives just mean the
-    old (safe, if wasteful) retry-forever behavior for that one message
-    shape, so this is intentionally over-inclusive rather than exact.
+    clean error code when a method is plan-gated. A single match is
+    deliberately NOT enough to disable a method on its own -- see
+    RpcGateway.method_disable_threshold -- so a false positive here costs
+    a few logged-but-otherwise-ordinary transient failures, not a
+    permanently killed method; a false negative just means the old (safe,
+    if wasteful) retry-forever behavior for that one message shape. This
+    is intentionally over-inclusive rather than exact, since the sustained
+    threshold is what actually guards against acting on a one-off match.
     """
     if not isinstance(error, dict):
         return False
@@ -163,7 +175,27 @@ class RpcGateway:
         # method fails instantly, with zero network I/O, instead of paying
         # a full retry cycle every single time it's called for the rest of
         # the run.
+        #
+        # A single 403 is NOT enough to disable a method -- it used to be,
+        # and that was a real bug: a 403 can mean a genuinely plan-gated
+        # method, but it can just as easily mean a transient WAF/proxy
+        # block, an IP-level hiccup, or anything else with no relation to
+        # "this method is permanently unavailable." One bad response used
+        # to permanently kill a method (getTransaction, in one observed
+        # case -- an utterly ordinary method no free tier actually
+        # restricts) for the rest of the run on the first blip, the exact
+        # same false-positive shape the RPC-outage kill switch and the
+        # indexing backoff both had to fix earlier by requiring sustained
+        # failures before acting. method_disable_threshold consecutive
+        # _MethodUnavailable signals for the SAME method (across separate
+        # call() invocations, e.g. different getTransaction signatures --
+        # not retries of the same request) are required before the method
+        # is actually disabled; short of that, it's treated as an ordinary
+        # transient failure (RpcOutage as usual) and the count keeps
+        # accumulating across calls.
         self._disabled_methods: set[str] = set()
+        self._method_unavailable_counts: Counter[str] = Counter()
+        self.method_disable_threshold = 3
 
         # Per-method call counters, for the RPC budget audit in the daily
         # report. Every attempted HTTP request counts, including retries --
@@ -236,7 +268,13 @@ class RpcGateway:
             extra={"fields": {"method": method, "backoff_s": backoff, "level": self._rate_limit_backoff_level, "detail": str(exc)}},
         )
 
-    def call(self, method: str, params: Optional[list] = None, max_retries: Optional[int] = None) -> Any:
+    def call(
+        self,
+        method: str,
+        params: Optional[list] = None,
+        max_retries: Optional[int] = None,
+        allow_method_disable: bool = True,
+    ) -> Any:
         """JSON-RPC call with retry/backoff, then failover, then RpcOutage.
 
         A 429 is never retried immediately: it trips a shared cooldown (see
@@ -256,10 +294,22 @@ class RpcGateway:
         retrying on a fixed ~1-2s schedule from the logs alone.
 
         A method that looks PERMANENTLY rejected (403, or a JSON-RPC error
-        that reads like "not available on this plan") is never retried at
-        all, on any URL or attempt -- see RpcMethodDisabled.
+        that reads like "not available on this plan") needs
+        method_disable_threshold sustained confirmations (see __init__)
+        before it's actually disabled -- see RpcMethodDisabled. Until then
+        it's treated as an ordinary transient failure.
+
+        `allow_method_disable=False` opts a call site out of the
+        disable mechanism entirely, always surfacing RpcOutage instead of
+        ever raising RpcMethodDisabled -- Orchestrator's indexing loop
+        passes this for getTransaction: it's such a fundamental,
+        universally-available method that treating any rejection of it as
+        "permanently unavailable on this plan" was mis-scoped to begin
+        with, and indexing already has its own dedicated, sustained-failure
+        backoff (see _index_program_loop) that handles a real outage on
+        this specific call site without needing this mechanism too.
         """
-        if method in self._disabled_methods:
+        if allow_method_disable and method in self._disabled_methods:
             raise RpcMethodDisabled(f"{method} was disabled earlier this run (looked permanently rejected) -- not retrying")
 
         effective_max_retries = self.max_retries if max_retries is None else max_retries
@@ -278,11 +328,41 @@ class RpcGateway:
                     self._consecutive_failures = 0
                     self._rate_limit_backoff_level = 0
                     self._cooldown_until = 0.0
+                    self._method_unavailable_counts[method] = 0
                     return data.get("result")
                 except _MethodUnavailable as exc:
-                    self._disabled_methods.add(method)
-                    self.logger.error("rpc_method_disabled", extra={"fields": {"method": method, "detail": str(exc)}})
-                    raise RpcMethodDisabled(f"{method} permanently disabled this run: {exc}") from exc
+                    last_exc = exc
+                    self._consecutive_failures += 1
+                    if not allow_method_disable:
+                        self.logger.warning(
+                            "rpc_method_rejection_ignored",
+                            extra={"fields": {"method": method, "detail": str(exc)}},
+                        )
+                        if attempt < effective_max_retries - 1:
+                            time.sleep(min(2 ** attempt * 0.5, 4.0))
+                        continue
+                    self._method_unavailable_counts[method] += 1
+                    count = self._method_unavailable_counts[method]
+                    if count >= self.method_disable_threshold:
+                        self._disabled_methods.add(method)
+                        self.logger.error(
+                            "rpc_method_disabled",
+                            extra={"fields": {"method": method, "detail": str(exc), "confirmations": count}},
+                        )
+                        raise RpcMethodDisabled(
+                            f"{method} permanently disabled this run after {count} sustained rejections: {exc}"
+                        ) from exc
+                    self.logger.warning(
+                        "rpc_method_possibly_unavailable",
+                        extra={
+                            "fields": {
+                                "method": method, "detail": str(exc), "confirmations": count,
+                                "threshold": self.method_disable_threshold,
+                            }
+                        },
+                    )
+                    if attempt < effective_max_retries - 1:
+                        time.sleep(min(2 ** attempt * 0.5, 4.0))
                 except RpcRateLimited as exc:
                     last_exc = exc
                     self._consecutive_failures += 1

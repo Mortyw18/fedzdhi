@@ -238,51 +238,102 @@ def test_rate_budget_rearms_only_after_dropping_to_clear_threshold():
 
 
 # ----------------------------------------------------------------------
-# permanent method rejection (403 / "method not available") detection
+# permanent method rejection (403 / "method not available") detection --
+# requires method_disable_threshold SUSTAINED confirmations (separate
+# call() invocations, not retries of one request) before actually
+# disabling a method. A single 403 used to disable immediately, which was
+# a real bug: getTransaction (an utterly ordinary method no free tier
+# restricts) got permanently killed by one non-representative 403 in
+# production, silencing indexing and event-driven discovery for the rest
+# of the run. See RpcMethodDisabled's docstring.
 # ----------------------------------------------------------------------
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
-def test_403_disables_the_method_immediately_no_further_retries(mock_sleep):
+def test_a_single_403_does_not_disable_the_method(mock_sleep):
     session = _ScriptedSession([("403",)])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+
+    assert gw.is_method_disabled("getProgramAccounts") is False
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_403_disables_the_method_after_sustained_confirmations(mock_sleep):
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    for _ in range(gw.method_disable_threshold - 1):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
+        assert gw.is_method_disabled("getProgramAccounts") is False
 
     with pytest.raises(RpcMethodDisabled):
         gw.call("getProgramAccounts")
-
-    assert session.calls == 1  # not max_retries=5 -- a 403 is never worth retrying
     assert gw.is_method_disabled("getProgramAccounts") is True
+    assert session.calls == 3
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_a_success_in_between_resets_the_confirmation_streak(mock_sleep):
+    session = _ScriptedSession([("403",), ("403",), ("ok", _ok_body()), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+    gw.call("getProgramAccounts")  # succeeds -- resets the streak
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+
+    assert gw.is_method_disabled("getProgramAccounts") is False  # never 3 IN A ROW
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
 def test_disabled_method_fails_instantly_on_next_call_no_network(mock_sleep):
-    session = _ScriptedSession([("403",)])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    for _ in range(gw.method_disable_threshold - 1):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+    assert session.calls == 3
 
     with pytest.raises(RpcMethodDisabled):
         gw.call("getProgramAccounts")
-    assert session.calls == 1
-
-    with pytest.raises(RpcMethodDisabled):
-        gw.call("getProgramAccounts")
-    assert session.calls == 1  # still 1 -- the second call never touched the network
+    assert session.calls == 3  # still 3 -- this call never touched the network
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
-def test_jsonrpc_method_not_found_code_disables_the_method(mock_sleep):
-    session = _ScriptedSession([("jsonrpc_error", {"code": -32601, "message": "Method not found"})])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+def test_jsonrpc_method_not_found_code_disables_after_sustained_confirmations(mock_sleep):
+    session = _ScriptedSession([("jsonrpc_error", {"code": -32601, "message": "Method not found"})] * 3)
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
 
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getSomeEnhancedMethod")
     with pytest.raises(RpcMethodDisabled):
         gw.call("getSomeEnhancedMethod")
     assert gw.is_method_disabled("getSomeEnhancedMethod") is True
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
-def test_jsonrpc_plan_gated_message_disables_the_method(mock_sleep):
-    session = _ScriptedSession([("jsonrpc_error", {"code": -32000, "message": "This method is not available on your current plan"})])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+def test_jsonrpc_plan_gated_message_disables_after_sustained_confirmations(mock_sleep):
+    session = _ScriptedSession(
+        [("jsonrpc_error", {"code": -32000, "message": "This method is not available on your current plan"})] * 3
+    )
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
 
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getSomeEnhancedMethod")
     with pytest.raises(RpcMethodDisabled):
         gw.call("getSomeEnhancedMethod")
     assert gw.is_method_disabled("getSomeEnhancedMethod") is True
@@ -306,11 +357,31 @@ def test_ordinary_jsonrpc_error_does_not_disable_the_method(mock_sleep):
 
 @mock.patch("bot.rpc_gateway.time.sleep")
 def test_disabled_methods_listed_in_call_stats(mock_sleep):
-    session = _ScriptedSession([("403",)])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
     with pytest.raises(RpcMethodDisabled):
         gw.call("getProgramAccounts")
     assert gw.get_call_stats()["disabled_methods"] == ["getProgramAccounts"]
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_allow_method_disable_false_never_disables_regardless_of_confirmations(mock_sleep):
+    """Orchestrator's indexing loop passes this for getTransaction:
+    already has its own dedicated sustained-failure backoff, and
+    getTransaction is fundamental enough that treating any rejection of
+    it as a permanent plan restriction was mis-scoped to begin with."""
+    session = _ScriptedSession([("403",)] * 10)
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    for _ in range(10):
+        with pytest.raises(RpcOutage):
+            gw.call("getTransaction", allow_method_disable=False)
+
+    assert gw.is_method_disabled("getTransaction") is False
+    assert session.calls == 10
 
 
 # ----------------------------------------------------------------------

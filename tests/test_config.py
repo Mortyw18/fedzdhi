@@ -129,3 +129,44 @@ def test_enable_pumpfun_from_dotenv_file(tmp_path, monkeypatch):
     env_file.write_text("ENABLE_PUMPFUN=false\n")
     cfg = load_config_from_env(str(env_file))
     assert cfg.enable_pumpfun_source is False
+
+
+# ----------------------------------------------------------------------
+# ENABLE_PUMPFUN_GRADUATION_LOOKUP env var -- deliberately independent of
+# ENABLE_PUMPFUN above. Turning off the dead pump.fun discovery/coin-list
+# endpoint used to also disable TokenSafety's graduation/LP-burn lookup
+# (a different pump.fun endpoint), false-rejecting every pump.fun-origin
+# candidate as "cannot resolve graduation" even when that endpoint was
+# fine. These two flags must vary independently.
+# ----------------------------------------------------------------------
+
+
+def test_enable_pumpfun_graduation_lookup_defaults_true_when_unset(tmp_path, monkeypatch):
+    _clear_env(monkeypatch, "ENABLE_PUMPFUN_GRADUATION_LOOKUP")
+    cfg = load_config_from_env(str(tmp_path / "nonexistent.env"))
+    assert cfg.enable_pumpfun_graduation_lookup is True
+
+
+def test_enable_pumpfun_graduation_lookup_survives_discovery_disabled(tmp_path, monkeypatch):
+    """The bug this decoupling fixes: ENABLE_PUMPFUN=false must NOT also
+    disable the graduation lookup."""
+    monkeypatch.setenv("ENABLE_PUMPFUN", "false")
+    _clear_env(monkeypatch, "ENABLE_PUMPFUN_GRADUATION_LOOKUP")
+    cfg = load_config_from_env(str(tmp_path / "nonexistent.env"))
+    assert cfg.enable_pumpfun_source is False
+    assert cfg.enable_pumpfun_graduation_lookup is True
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no"])
+def test_enable_pumpfun_graduation_lookup_false_values_disable_it(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("ENABLE_PUMPFUN_GRADUATION_LOOKUP", value)
+    cfg = load_config_from_env(str(tmp_path / "nonexistent.env"))
+    assert cfg.enable_pumpfun_graduation_lookup is False
+
+
+def test_enable_pumpfun_graduation_lookup_from_dotenv_file(tmp_path, monkeypatch):
+    _clear_env(monkeypatch, "ENABLE_PUMPFUN_GRADUATION_LOOKUP")
+    env_file = tmp_path / ".env"
+    env_file.write_text("ENABLE_PUMPFUN_GRADUATION_LOOKUP=false\n")
+    cfg = load_config_from_env(str(env_file))
+    assert cfg.enable_pumpfun_graduation_lookup is False

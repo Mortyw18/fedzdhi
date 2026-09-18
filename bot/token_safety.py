@@ -93,9 +93,14 @@ class TokenSafety:
         self.bundled_launch_min_distinct_tokens = bundled_launch_min_distinct_tokens
         self.bundle_cluster_min_wallets = bundle_cluster_min_wallets
         self.rugcheck_session = rugcheck_session or requests.Session()
-        # Same on/off switch as SignalEngine's enable_pumpfun_source: pump.fun's
-        # API is the same unofficial, occasionally-530ing endpoint either way,
-        # so one config flag disables both call sites at once.
+        # Deliberately a SEPARATE switch from SignalEngine's enable_pumpfun_source
+        # (Config.enable_pumpfun_graduation_lookup wires this one in
+        # orchestrator.py) -- the coin-info endpoint this class hits for
+        # graduation/LP-burn checks is a different URL path from the
+        # coin-list discovery endpoint SignalEngine polls, and only the
+        # latter is confirmed 530-blocked. Coupling them meant turning off
+        # dead discovery also silently false-rejected every pump.fun
+        # candidate's safety check.
         self.pumpfun_session = pumpfun_session or requests.Session()
         self.enable_pumpfun_lookups = enable_pumpfun_lookups
         self.logger = logger or logging.getLogger("memebot.token_safety")
@@ -216,7 +221,7 @@ class TokenSafety:
         if not self.enable_pumpfun_lookups:
             return SafetyCheckResult(
                 "lp_burned_or_graduated", False,
-                "pump.fun lookups disabled via config (enable_pumpfun_source=False) -- cannot resolve graduation",
+                "pump.fun lookups disabled via config (enable_pumpfun_graduation_lookup=False) -- cannot resolve graduation",
             )
         try:
             resp = self.pumpfun_session.get(
