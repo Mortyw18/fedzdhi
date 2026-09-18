@@ -12,7 +12,7 @@ shows we're passing almost everything, the thresholds are wrong.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -46,6 +46,11 @@ RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
 # not import InsiderRadar (InsiderRadar imports TokenSafety for copy checks).
 DistinctTokenLookup = Callable[[str], int]
 
+# Sentinel meaning "no pre-fetched value given -- fetch it yourself." Plain
+# None is a valid, meaningful value here (mint account genuinely not found),
+# so it can't double as "not provided."
+_UNFETCHED = object()
+
 
 class TokenSafety:
     def __init__(
@@ -68,13 +73,27 @@ class TokenSafety:
         self.rugcheck_session = rugcheck_session or requests.Session()
         self.logger = logger or logging.getLogger("memebot.token_safety")
 
+        # Burn addresses and AMM program IDs never change, so once we've
+        # resolved a token account's owner or an owner's controlling program,
+        # that answer is good for the rest of the process. This -- combined
+        # with batching lookups via get_multiple_accounts below -- is what
+        # keeps a single evaluate() call from costing dozens of RPC requests.
+        self._owner_cache: dict[str, Optional[str]] = {}
+        self._pool_authority_cache: dict[str, bool] = {}
+
     # ------------------------------------------------------------------
     # individual checks -- each returns a SafetyCheckResult, never raises
     # ------------------------------------------------------------------
 
-    def check_mint_freeze_authority(self, candidate: Candidate) -> SafetyCheckResult:
+    def _fetch_mint_info(self, mint: str) -> Optional[dict]:
+        """Fetched once per evaluate() and shared between the mint/freeze
+        and transfer-fee checks -- they used to each fetch this account
+        independently, doubling that RPC cost for no reason."""
+        return self.rpc.get_account_info(mint, encoding="jsonParsed")
+
+    def check_mint_freeze_authority(self, candidate: Candidate, mint_info: Any = _UNFETCHED) -> SafetyCheckResult:
         try:
-            info = self.rpc.get_account_info(candidate.mint, encoding="jsonParsed")
+            info = self._fetch_mint_info(candidate.mint) if mint_info is _UNFETCHED else mint_info
         except RpcError as exc:
             return SafetyCheckResult("mint_freeze_authority", False, f"rpc error: {exc}")
         if not info:
@@ -108,11 +127,11 @@ class TokenSafety:
         total = float(supply["amount"]) if supply else 0.0
         if total <= 0:
             return SafetyCheckResult("lp_burned_or_graduated", False, "LP mint has zero supply (unexpected)")
-        burned_or_locked = 0.0
-        for acct in largest:
-            owner = self._resolve_token_account_owner(acct["address"])
-            if owner in BURN_ADDRESSES:
-                burned_or_locked += float(acct["amount"])
+
+        owners_by_account = self._resolve_owners_batch([acct["address"] for acct in largest])
+        burned_or_locked = sum(
+            float(acct["amount"]) for acct in largest if owners_by_account.get(acct["address"]) in BURN_ADDRESSES
+        )
         locked_pct = burned_or_locked / total
         if locked_pct < 0.80:
             return SafetyCheckResult(
@@ -120,23 +139,33 @@ class TokenSafety:
             )
         return SafetyCheckResult("lp_burned_or_graduated", True, f"{locked_pct:.1%} of LP burned/locked")
 
-    def _resolve_token_account_owner(self, token_account_address: str) -> Optional[str]:
-        try:
-            info = self.rpc.get_account_info(token_account_address, encoding="jsonParsed")
-        except RpcError:
-            return None
-        if not info:
-            return None
-        return info.get("data", {}).get("parsed", {}).get("info", {}).get("owner")
+    def _resolve_owners_batch(self, token_account_addresses: list[str]) -> dict[str, Optional[str]]:
+        """{token_account_address: owner_or_None}, in ONE getMultipleAccounts
+        call for whatever isn't already cached -- see __init__'s comment on
+        why this is safe to cache for the life of the process."""
+        to_fetch = [a for a in dict.fromkeys(token_account_addresses) if a not in self._owner_cache]
+        if to_fetch:
+            try:
+                infos = self.rpc.get_multiple_accounts(to_fetch)
+            except RpcError:
+                infos = [None] * len(to_fetch)
+            for addr, info in zip(to_fetch, infos):
+                owner = info.get("data", {}).get("parsed", {}).get("info", {}).get("owner") if info else None
+                self._owner_cache[addr] = owner
+        return {addr: self._owner_cache.get(addr) for addr in token_account_addresses}
 
-    def _owner_is_pool_authority(self, owner_address: str) -> bool:
-        try:
-            owner_account = self.rpc.get_account_info(owner_address, encoding="jsonParsed")
-        except RpcError:
-            return False
-        if not owner_account:
-            return False
-        return owner_account.get("owner") in KNOWN_AMM_PROGRAM_IDS
+    def _resolve_pool_authorities_batch(self, owner_addresses: list[str]) -> dict[str, bool]:
+        """{owner_address: is_a_known_amm_pool_authority}, batched the same way."""
+        unique = list(dict.fromkeys(owner_addresses))
+        to_fetch = [a for a in unique if a not in self._pool_authority_cache]
+        if to_fetch:
+            try:
+                infos = self.rpc.get_multiple_accounts(to_fetch)
+            except RpcError:
+                infos = [None] * len(to_fetch)
+            for addr, info in zip(to_fetch, infos):
+                self._pool_authority_cache[addr] = bool(info and info.get("owner") in KNOWN_AMM_PROGRAM_IDS)
+        return {addr: self._pool_authority_cache.get(addr, False) for addr in unique}
 
     def check_holder_concentration(self, candidate: Candidate) -> SafetyCheckResult:
         try:
@@ -148,15 +177,22 @@ class TokenSafety:
         if total <= 0:
             return SafetyCheckResult("holder_concentration", False, "token has zero supply (unexpected)")
 
+        # Two batched calls total (owners, then pool-authority-of-owners)
+        # instead of up to ~40 individual getAccountInfo calls -- this is
+        # the single biggest RPC cost in the whole safety pipeline, and the
+        # main reason a handful of candidates could blow the Helius free
+        # tier's budget in seconds.
+        owners_by_account = self._resolve_owners_batch([acct["address"] for acct in largest])
+        candidate_owners = [o for o in owners_by_account.values() if o is not None and o not in BURN_ADDRESSES]
+        pool_flags = self._resolve_pool_authorities_batch(candidate_owners)
+
         counted = 0.0
         kept = 0
         for acct in largest:
-            owner = self._resolve_token_account_owner(acct["address"])
-            if owner is None:
+            owner = owners_by_account.get(acct["address"])
+            if owner is None or owner in BURN_ADDRESSES:
                 continue
-            if owner in BURN_ADDRESSES:
-                continue
-            if self._owner_is_pool_authority(owner):
+            if pool_flags.get(owner, False):
                 continue
             counted += float(acct["amount"])
             kept += 1
@@ -172,9 +208,9 @@ class TokenSafety:
             )
         return SafetyCheckResult("holder_concentration", True, f"top-10 non-pool holders control {pct:.1%} of supply")
 
-    def check_transfer_fee_extension(self, candidate: Candidate) -> SafetyCheckResult:
+    def check_transfer_fee_extension(self, candidate: Candidate, mint_info: Any = _UNFETCHED) -> SafetyCheckResult:
         try:
-            info = self.rpc.get_account_info(candidate.mint, encoding="jsonParsed")
+            info = self._fetch_mint_info(candidate.mint) if mint_info is _UNFETCHED else mint_info
         except RpcError as exc:
             return SafetyCheckResult("transfer_fee_tax", False, f"rpc error: {exc}")
         if not info:
@@ -282,10 +318,17 @@ class TokenSafety:
     ) -> SafetyVerdict:
         checks: list[SafetyCheckResult] = []
 
-        checks.append(self.check_mint_freeze_authority(candidate))
+        # Fetched once and shared between the two checks that both need the
+        # mint account -- see _fetch_mint_info's docstring.
+        try:
+            mint_info = self._fetch_mint_info(candidate.mint)
+        except RpcError:
+            mint_info = None
+
+        checks.append(self.check_mint_freeze_authority(candidate, mint_info=mint_info))
         checks.append(self.check_lp_or_graduation(candidate))
         checks.append(self.check_holder_concentration(candidate))
-        checks.append(self.check_transfer_fee_extension(candidate))
+        checks.append(self.check_transfer_fee_extension(candidate, mint_info=mint_info))
 
         price_impact_check, quote = self.check_price_impact(candidate, position_size_lamports)
         checks.append(price_impact_check)

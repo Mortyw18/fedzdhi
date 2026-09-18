@@ -9,6 +9,7 @@ before a single network call to a paid or rate-limited service is made.
 from __future__ import annotations
 
 import sys
+import time
 
 from bot.accounting import Accounting
 from bot.config import ConfigError, apply_cli_overrides, build_arg_parser, confirm_startup, load_config_from_env, require_typed_confirmation
@@ -26,8 +27,42 @@ def _cmd_daily_report(cfg) -> int:
     return 0
 
 
+def _cmd_radar_stats(cfg) -> int:
+    """InsiderRadar's own state lives entirely in the running process's
+    memory -- this only ever shows what the bot last snapshotted into
+    SQLite (every rpc_budget_snapshot_interval_s, default 60s), so it can
+    be a little stale but is never wrong about the shape of the data."""
+    accounting = Accounting(cfg.db_path)
+    snapshot = accounting.latest_radar_snapshot()
+    accounting.close()
+    if snapshot is None:
+        print(
+            "No InsiderRadar snapshots recorded yet. Either the bot hasn't run long enough\n"
+            "to hit its first snapshot interval, or it hasn't been started at all."
+        )
+        return 0
+    age_s = time.time() - snapshot["timestamp"]
+    print("=== InsiderRadar Stats ===")
+    print(f"As of: {age_s / 60:.1f} minutes ago")
+    print(f"Wallets indexed:   {snapshot['wallets_indexed']}")
+    print(f"Tokens tracked:    {snapshot['tokens_tracked']}")
+    print(f"Buy events seen:   {snapshot['total_buy_events']}")
+    print(f"Sell events seen:  {snapshot['total_sell_events']}")
+    print(f"Sniper wallets:    {snapshot['sniper_count']} (never copied)")
+    print(f"Conviction wallets:{snapshot['conviction_count']:>3} (copyable)")
+    print(f"Auto-unfollowed:   {snapshot['unfollowed_count']}")
+    print(f"Currently watched: {snapshot['watch_list_size']}")
+    if snapshot["wallets_indexed"] == 0:
+        print(
+            "\nZero wallets indexed. If this bot has been running for a while, check that\n"
+            "HELIUS_WS_URL is set (WebSocket indexing needs it) and look for "
+            "'indexing notification dropped' or 'ws subscribe ... dropped' lines in the logs."
+        )
+    return 0
+
+
 def _cmd_reset_kill_switch(cfg) -> int:
-    ks = KillSwitch(cfg.daily_loss_cap_sol, state_path="data/kill_switch_state.json")
+    ks = KillSwitch(cfg.daily_loss_cap_sol, state_path=cfg.kill_switch_state_path)
     was_halted = ks.is_halted()
     reason = ks.halt_reason()
     ks.reset()
@@ -81,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.daily_report:
         return _cmd_daily_report(cfg)
+    if args.radar_stats:
+        return _cmd_radar_stats(cfg)
     if args.reset_kill_switch:
         return _cmd_reset_kill_switch(cfg)
     if args.sweep:

@@ -113,14 +113,19 @@ class RiskManager:
     # daily-loss cap bookkeeping (kill switch owns the halt itself)
     # ------------------------------------------------------------------
 
-    def register_realized_pnl(self, pnl_sol: float) -> None:
-        self.kill_switch.record_pnl(pnl_sol)
+    def register_realized_pnl(self, pnl_sol: float) -> bool:
+        """Returns True only if this call newly tripped the kill switch
+        (the daily loss cap), so callers know whether to alert. See
+        KillSwitch.record_pnl."""
+        return self.kill_switch.record_pnl(pnl_sol)
 
     def register_buy(self) -> None:
         self.kill_switch.record_buy()
 
-    def register_execution_failure(self) -> None:
-        self.kill_switch.record_execution_failure()
+    def register_execution_failure(self) -> bool:
+        """Returns True only if this call newly tripped the kill switch
+        (too many consecutive failures). See KillSwitch.record_execution_failure."""
+        return self.kill_switch.record_execution_failure()
 
     def register_execution_success(self) -> None:
         self.kill_switch.record_execution_success()

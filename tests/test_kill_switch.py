@@ -35,11 +35,34 @@ def test_success_resets_failure_streak(tmp_path):
     assert ks.is_halted() is False  # streak was reset, only at 2 again
 
 
-def test_rpc_outage_halts(tmp_path):
-    ks = _ks(tmp_path)
+def test_rpc_outage_halts_only_after_sustained_failures(tmp_path):
+    """A single blip must never trip this -- see KillSwitch's module
+    docstring for the false-positive this threshold exists to prevent."""
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=3)
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False
     ks.set_rpc_outage(True)
     assert ks.is_halted() is True
     assert "RPC outage" in ks.halt_reason()
+    assert "3 consecutive" in ks.halt_reason()
+
+
+def test_single_rpc_outage_never_trips_on_its_own(tmp_path):
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=3)
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False
+
+
+def test_rpc_success_resets_the_outage_streak(tmp_path):
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=3)
+    ks.set_rpc_outage(True)
+    ks.set_rpc_outage(True)
+    ks.set_rpc_outage(False)  # a success in between -- streak resets
+    ks.set_rpc_outage(True)
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False  # only 2 consecutive since the reset, not 4
 
 
 def test_manual_reset_required(tmp_path):
@@ -72,3 +95,65 @@ def test_buys_today_tracked(tmp_path):
     ks.record_buy()
     ks.record_buy()
     assert ks.buys_today == 2
+
+
+# ----------------------------------------------------------------------
+# latching: each record_* returns True ONLY on the transition into halted,
+# so callers (Orchestrator, ExitMonitor) know to alert once and then stay
+# silent -- this is what stops the reported "re-trips and re-alerts every
+# 2-3 seconds" behavior.
+# ----------------------------------------------------------------------
+
+
+def test_record_pnl_returns_true_only_on_first_trip(tmp_path):
+    ks = _ks(tmp_path)
+    assert ks.record_pnl(-0.02) is False  # under the cap, no trip
+    assert ks.record_pnl(-0.03) is True  # this call crosses the cap -- newly tripped
+    # Further losses while already halted must not report a new trip, even
+    # though the underlying condition (being over the loss cap) still holds.
+    assert ks.record_pnl(-0.01) is False
+    assert ks.record_pnl(-0.01) is False
+
+
+def test_record_execution_failure_returns_true_only_on_first_trip(tmp_path):
+    ks = _ks(tmp_path, max_consecutive_failures=3)
+    assert ks.record_execution_failure() is False
+    assert ks.record_execution_failure() is False
+    assert ks.record_execution_failure() is True  # 3rd failure crosses the threshold
+    assert ks.record_execution_failure() is False  # still halted, not a new trip
+    assert ks.record_execution_failure() is False
+
+
+def test_set_rpc_outage_returns_true_only_on_first_trip(tmp_path):
+    # max_consecutive_rpc_outages=1 isolates the latch behavior under test
+    # here from the sustained-failure threshold, which has its own tests
+    # above -- this test is purely "once halted, stop reporting new trips."
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=1)
+    assert ks.set_rpc_outage(True) is True
+    # A flood of repeated RpcOutage exceptions (e.g. one per WebSocket
+    # notification, arriving every few seconds) must each report "not a
+    # new trip" once already halted -- this is the exact call pattern that
+    # was spamming alerts.
+    for _ in range(50):
+        assert ks.set_rpc_outage(True) is False
+
+
+def test_reset_then_new_trip_reports_true_again(tmp_path):
+    """A reset is a real state change back to 'not halted', so the NEXT
+    trip afterward is genuinely new and must alert again."""
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=1)
+    assert ks.set_rpc_outage(True) is True
+    assert ks.set_rpc_outage(True) is False
+    ks.reset()
+    assert ks.set_rpc_outage(True) is True
+
+
+def test_different_trip_reasons_do_not_double_report_while_already_halted(tmp_path):
+    """Once halted for one reason, a second, different condition tripping
+    must not report as newly-tripped either -- there's only one halted
+    state, and only its first entry is news."""
+    ks = _ks(tmp_path, max_consecutive_failures=3)
+    assert ks.record_pnl(-0.05) is True
+    assert ks.record_execution_failure() is False
+    assert ks.record_execution_failure() is False
+    assert ks.record_execution_failure() is False  # would trip failures on its own, but already halted

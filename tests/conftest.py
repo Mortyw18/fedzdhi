@@ -35,14 +35,25 @@ class FakeRpc:
         self.confirm_result = True
         self.transactions: dict[str, dict] = {}
         self.prioritization_fees: list[dict] = [{"prioritizationFee": 5000}]
+        # Every method call is logged here so tests can assert on RPC volume
+        # (e.g. "holder concentration must not cost more than a handful of
+        # calls") without needing a real RpcGateway's budget tracker.
+        self.call_log: list[str] = []
 
     def get_account_info(self, pubkey, encoding="jsonParsed"):
+        self.call_log.append("getAccountInfo")
         return self.accounts.get(pubkey)
 
+    def get_multiple_accounts(self, pubkeys, encoding="jsonParsed"):
+        self.call_log.append("getMultipleAccounts")
+        return [self.accounts.get(pk) for pk in pubkeys]
+
     def get_token_supply(self, mint):
+        self.call_log.append("getTokenSupply")
         return self.token_supply.get(mint)
 
     def get_token_largest_accounts(self, mint):
+        self.call_log.append("getTokenLargestAccounts")
         return self.largest_accounts.get(mint, [])
 
     def simulate_transaction(self, tx_b64, sig_verify=False):

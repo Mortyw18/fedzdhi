@@ -19,6 +19,78 @@ network congestion.
 plan. Revisit only if `RpcGateway`'s 70%-budget alerts start firing
 routinely.
 
+## The free tier is a design constraint, not an afterthought
+
+Three things in the code exist specifically to keep this bot inside a
+free-tier RPC budget, not just to survive an occasional spike:
+
+- **TokenSafety batches, never loops, per-holder RPC calls.** The
+  holder-concentration and LP-burn checks used to make up to ~2 individual
+  `getAccountInfo` calls per top holder (owner lookup, then
+  pool-authority lookup) -- worst case, ~40 calls for ONE candidate's
+  holder check alone. They now resolve all holders in a single batched
+  `getMultipleAccounts` call each (owners, then pool authorities), so the
+  cost is ~4 RPC calls regardless of how many holders there are. The mint
+  account is also fetched once per candidate and shared between the
+  mint/freeze and transfer-fee checks instead of being fetched twice.
+- **InsiderRadar's on-chain indexing is the lowest-priority RPC
+  consumer, and it knows it.** A `logsSubscribe` on an AMM program's logs
+  can be a genuinely enormous stream -- most swap activity on that
+  program network-wide, not just candidates this bot cares about. Before
+  spending an RPC call on any indexing notification, the bot checks
+  whether the kill switch is halted or the gateway's own rolling budget
+  usage is already above `indexing_max_rpc_budget_pct` (default 50%) and,
+  if so, drops the notification without ever calling `getTransaction`.
+  TokenSafety and ExitMonitor -- the checks a live trade is actually
+  waiting on -- always get priority over background learning.
+- **A 429 never triggers an immediate retry.** `RpcGateway` treats a 429
+  as a signal to stop entirely for a while: it sets a shared,
+  gateway-wide cooldown (exponential, capped at 60s, reset only after a
+  call actually succeeds) that every subsequent call -- from any code
+  path -- waits out before trying again. This is what actually stops a
+  rate-limit episode from turning into the death spiral of "every caller
+  retries a few times, which trips the limit further, which makes every
+  caller retry again."
+
+The RPC budget itself is audited, not just capped: `RpcGateway` tracks
+per-method call counts and calls-per-minute live, and the running bot
+snapshots that into SQLite every `rpc_budget_snapshot_interval_s`
+(default 60s) so `python run.py --daily-report` shows average/peak
+calls-per-minute, peak budget usage, and the top methods by call count
+for the day -- even though that command itself never starts a live
+gateway. If the report shows budget usage regularly peaking near 100%,
+that's the signal to either raise `dexscreener_poll_interval_s`, lower
+`indexing_max_rpc_budget_pct` further, or move to a paid RPC tier --
+not to loosen the budget tracker's own limit.
+
+### A day of "RPC budget: 0.0" is not automatically a bug
+
+`RpcGateway`'s budget tracker only counts calls that actually go through
+`RpcGateway.call()` -- and only two things in this codebase ever do
+that: `TokenSafety`'s checks (mint/holder/LP/honeypot) and InsiderRadar's
+indexing loop's `getTransaction` lookups. Two entire, load-bearing parts
+of the pipeline never touch it at all, by design:
+
+- **DexScreener polling** uses `SignalEngine`'s own `requests.Session`,
+  talking directly to `api.dexscreener.com` -- not Helius, not
+  `RpcGateway`, at any point.
+- **WebSocket indexing** (`RpcWebSocket`) opens its own raw
+  `websockets.connect()` to Helius's WS endpoint and does its own
+  JSON-RPC framing over that socket. It never calls `RpcGateway.call()`
+  either, so `logsSubscribe` traffic doesn't touch the HTTP budget
+  tracker regardless of how many notifications arrive.
+
+So if `TokenSafety.evaluate()` was never invoked (no candidate ever
+passed SignalEngine's filters) and the indexing loop never got as far as
+a successful `getTransaction` (e.g. it was skipped by the kill-switch
+guard, or budget-priority backoff, the whole run), the RPC budget
+snapshot legitimately reads all zeroes for the entire period -- not
+because tracking broke, but because nothing that counts against it ever
+ran. Check `--radar-stats` and the `dexscreener_poll_summary` /
+`heartbeat` log lines before assuming a flat RPC budget line means the
+tracker itself is broken; it usually means the funnel upstream of it is
+empty.
+
 ## Per-trade fee estimate
 
 | Component | Estimate | Notes |

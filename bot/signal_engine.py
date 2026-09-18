@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import Counter
 from typing import Awaitable, Callable, Optional, Union
 
 import requests
@@ -40,7 +41,19 @@ class SignalEngine:
         dexscreener_poll_interval_s: float = 45.0,
         pumpfun_poll_interval_s: float = 20.0,
         pumpfun_max_consecutive_failures: int = 5,
-        dexscreener_query: str = "solana",
+        # DexScreener's /search endpoint is a keyword text search over
+        # token name/symbol/address, NOT a chain filter -- it does not mean
+        # "give me pairs on this chain." An overnight run with
+        # dexscreener_query="solana" logged 0 signals for 10 hours because
+        # the literal word "solana" almost never appears in a pair's name
+        # or symbol, so the chainId=="solana" filter below had nothing to
+        # keep. "SOL" works because it's the actual quote-token symbol on
+        # nearly every Solana memecoin pair -- see poll_dexscreener_once's
+        # funnel log (raw_pairs vs solana_pairs) if this default ever stops
+        # working; DexScreener's search ranking/limits aren't documented
+        # and can change without notice.
+        dexscreener_query: str = "SOL",
+        enable_pumpfun_source: bool = True,
         session: Optional[requests.Session] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -56,6 +69,12 @@ class SignalEngine:
         self.session = session or requests.Session()
         self.logger = logger or logging.getLogger("memebot.signal_engine")
         self._seen_mints: set[str] = set()
+        # Lifetime poll counts, purely for the heartbeat log -- "0 signals
+        # for 10 hours" looked identical to "the bot is quietly idle" until
+        # these existed; now polls_done=0 in the heartbeat is a completely
+        # different, immediately diagnosable signal from polls_done=1200.
+        self.dexscreener_polls_done = 0
+        self.pumpfun_polls_done = 0
 
         # pump.fun's API is unofficial, unauthenticated, and has been known
         # to sit behind Cloudflare returning 5xx (530 = origin unreachable)
@@ -65,20 +84,30 @@ class SignalEngine:
         # for this run (one clear log line) instead of hammering a dead
         # endpoint on every cycle forever.
         self.pumpfun_consecutive_failures = 0
-        self.pumpfun_disabled = False
+        # enable_pumpfun_source=False and pumpfun_disabled=True look similar
+        # but mean different things: the former is an operator's own choice
+        # (config), logged once at startup; the latter is this engine giving
+        # up on its own after real failures. Both result in a no-op poll.
+        self.pumpfun_disabled = not enable_pumpfun_source
+        if not enable_pumpfun_source:
+            self.logger.warning("pump.fun source disabled via config (enable_pumpfun_source=False)")
 
     # ------------------------------------------------------------------
     # DexScreener
     # ------------------------------------------------------------------
 
     def fetch_dexscreener_pairs(self) -> list[dict]:
+        """Raw search results, every chain DexScreener's text match returned --
+        NOT pre-filtered to Solana. poll_dexscreener_once does that filtering
+        itself so it can log how many raw results even were on-chain before
+        any threshold is applied; see the funnel log for why that split
+        matters."""
         resp = self.session.get(
             DEXSCREENER_SEARCH_URL, params={"q": self.dexscreener_query}, timeout=10.0
         )
         resp.raise_for_status()
         data = resp.json()
-        pairs = data.get("pairs") or []
-        return [p for p in pairs if p.get("chainId") == "solana"]
+        return data.get("pairs") or []
 
     @staticmethod
     def parse_dexscreener_pair(raw: dict) -> Optional[Candidate]:
@@ -107,21 +136,26 @@ class SignalEngine:
         )
 
     def passes_filters(self, candidate: Candidate) -> tuple[bool, str]:
+        """Returns (passed, reason). `reason` always starts with a stable,
+        colon-delimited bucket code (e.g. "pool_age:", "liquidity_range:")
+        followed by the human-readable detail, so poll_dexscreener_once's
+        funnel log can count rejections by bucket without re-parsing
+        free-form English."""
         if candidate.pool_age_s > self.max_pool_age_s:
-            return False, f"pool age {candidate.pool_age_s / 3600:.1f}h exceeds {self.max_pool_age_s / 3600:.0f}h"
+            return False, f"pool_age: {candidate.pool_age_s / 3600:.1f}h exceeds {self.max_pool_age_s / 3600:.0f}h"
+        if candidate.liquidity_usd <= 0:
+            return False, "zero_liquidity: no liquidity reported"
         if not (self.min_pool_liquidity_usd <= candidate.liquidity_usd <= self.max_pool_liquidity_usd):
             return False, (
-                f"liquidity ${candidate.liquidity_usd:,.0f} outside "
+                f"liquidity_range: ${candidate.liquidity_usd:,.0f} outside "
                 f"[${self.min_pool_liquidity_usd:,.0f}, ${self.max_pool_liquidity_usd:,.0f}]"
             )
-        if candidate.liquidity_usd <= 0:
-            return False, "zero liquidity"
         vol_liq_ratio = candidate.volume_5m_usd / candidate.liquidity_usd
         if vol_liq_ratio < self.min_volume_liquidity_ratio:
-            return False, f"5m volume/liquidity ratio {vol_liq_ratio:.2f} below {self.min_volume_liquidity_ratio:.2f}"
+            return False, f"volume_liquidity_ratio: {vol_liq_ratio:.2f} below {self.min_volume_liquidity_ratio:.2f}"
         if candidate.buy_sell_ratio < self.min_buy_sell_ratio:
-            return False, f"buy/sell ratio {candidate.buy_sell_ratio:.2f} below {self.min_buy_sell_ratio:.2f}"
-        return True, "passes trend filters"
+            return False, f"buy_sell_ratio: {candidate.buy_sell_ratio:.2f} below {self.min_buy_sell_ratio:.2f}"
+        return True, "ok: passes trend filters"
 
     def fetch_candidate_by_mint(self, mint: str) -> Optional[Candidate]:
         """Fresh single-token lookup, used for pricing an insider copy-trade signal."""
@@ -139,21 +173,54 @@ class SignalEngine:
         return self.parse_dexscreener_pair(best)
 
     def poll_dexscreener_once(self) -> list[Candidate]:
+        """Every cycle ends with one INFO-level funnel log
+        (raw pairs -> on-chain pairs -> parseable -> pass/fail per
+        threshold bucket), specifically so "0 candidates" is diagnosable
+        from the logs alone instead of looking identical to "everything's
+        fine, just quiet" -- that gap is exactly what let a bad search
+        query run for 10 hours unnoticed."""
+        self.dexscreener_polls_done += 1
         try:
             raw_pairs = self.fetch_dexscreener_pairs()
         except (requests.RequestException, ValueError) as exc:
+            self.logger.info(
+                "dexscreener_poll_summary",
+                extra={"fields": {"query": self.dexscreener_query, "error": str(exc), "raw_pairs": 0, "solana_pairs": 0, "passed_filters": 0}},
+            )
             self.logger.warning("dexscreener poll failed: %s", exc)
             return []
+
+        solana_pairs = [p for p in raw_pairs if p.get("chainId") == "solana"]
+
         out: list[Candidate] = []
-        for raw in raw_pairs:
+        unparseable = 0
+        rejection_buckets: Counter[str] = Counter()
+        for raw in solana_pairs:
             candidate = self.parse_dexscreener_pair(raw)
             if candidate is None:
+                unparseable += 1
                 continue
             ok, reason = self.passes_filters(candidate)
             if ok:
                 out.append(candidate)
             else:
+                bucket = reason.split(":", 1)[0]
+                rejection_buckets[bucket] += 1
                 self.logger.debug("dexscreener candidate filtered: %s (%s)", candidate.mint, reason)
+
+        self.logger.info(
+            "dexscreener_poll_summary",
+            extra={
+                "fields": {
+                    "query": self.dexscreener_query,
+                    "raw_pairs": len(raw_pairs),
+                    "solana_pairs": len(solana_pairs),
+                    "unparseable": unparseable,
+                    "passed_filters": len(out),
+                    "rejected_by": dict(rejection_buckets),
+                }
+            },
+        )
         return out
 
     # ------------------------------------------------------------------
@@ -161,9 +228,27 @@ class SignalEngine:
     # ------------------------------------------------------------------
 
     def fetch_pumpfun_new_coins(self, limit: int = 50) -> list[dict]:
+        # frontend-api.pump.fun sits behind Cloudflare and has been observed
+        # returning 530 (origin unreachable) for requests with no browser-like
+        # headers -- a default `requests` User-Agent is an easy tell for a
+        # scripted client. These headers are a best effort, not a guarantee:
+        # a genuine origin outage (which 530 usually means) isn't fixable by
+        # spoofing a browser, and enable_pumpfun_source=False is the reliable
+        # fallback if this keeps failing (see poll_pumpfun_once's own
+        # consecutive-failure circuit breaker for the automatic version).
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://pump.fun/",
+            "Origin": "https://pump.fun",
+        }
         resp = self.session.get(
             PUMPFUN_NEW_COINS_URL,
             params={"offset": 0, "limit": limit, "sort": "created_timestamp", "order": "DESC"},
+            headers=headers,
             timeout=10.0,
         )
         resp.raise_for_status()
@@ -193,6 +278,7 @@ class SignalEngine:
     def poll_pumpfun_once(self) -> list[Candidate]:
         if self.pumpfun_disabled:
             return []
+        self.pumpfun_polls_done += 1
         try:
             raw_coins = self.fetch_pumpfun_new_coins()
         except Exception as exc:  # noqa: BLE001 - unofficial API, any failure shape must degrade, never crash
