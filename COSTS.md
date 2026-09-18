@@ -119,6 +119,14 @@ load-bearing parts of the pipeline never touch it at all, by design:
   their own `requests.Session`s (pump.fun's coin API, Jupiter's quote API,
   RugCheck) -- none of them touch `RpcGateway` either, same as DexScreener
   and pump.fun's coin-discovery polling above.
+- **Event-driven pool-creation detection costs zero additional RPC calls.**
+  `Orchestrator._check_pool_creation` runs on the SAME transaction the
+  indexing loop already fetched via `getTransaction` for wallet-activity
+  parsing -- it's a second thing done with data already paid for, not a
+  second subscription or a second RPC round-trip. Second-wave's periodic
+  price sampling (`_second_wave_loop`, `SignalEngine.fetch_candidate_by_mint`)
+  also never touches `RpcGateway` -- it's the same DexScreener
+  `requests.Session` as everything else DexScreener-sourced.
 
 So if `TokenSafety.evaluate()` was never invoked (no candidate ever
 passed SignalEngine's filters) and the indexing loop never got as far as

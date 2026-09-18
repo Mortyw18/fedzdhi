@@ -100,10 +100,13 @@ def _clear_env(monkeypatch, *names):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_enable_pumpfun_defaults_true_when_unset(tmp_path, monkeypatch):
+def test_enable_pumpfun_defaults_false_when_unset(tmp_path, monkeypatch):
+    """pump.fun's API was confirmed 530-blocked in production use of this
+    bot -- defaulting to enabled just wasted 5 retries against a
+    known-dead endpoint every single run."""
     _clear_env(monkeypatch, "ENABLE_PUMPFUN")
     cfg = load_config_from_env(str(tmp_path / "nonexistent.env"))
-    assert cfg.enable_pumpfun_source is True
+    assert cfg.enable_pumpfun_source is False
 
 
 @pytest.mark.parametrize("value", ["false", "False", "FALSE", "0", "no", "No"])

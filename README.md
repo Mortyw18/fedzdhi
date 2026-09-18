@@ -127,7 +127,8 @@ why 0.05 SOL is the hard default and 0.1 SOL requires both
 | Solana wallet | `bot/solana_wallet.py` | Keypair loading, raw Ed25519 signing of Jupiter transactions, no external Solana SDK dependency |
 | JupiterClient | `bot/jupiter_client.py` | Jupiter v6 quote/swap, the slippage doctrine formula, sell-simulation for honeypot checks |
 | TokenSafety | `bot/token_safety.py` | The core gate. Every candidate, from either signal source, passes here before any buy |
-| SignalEngine | `bot/signal_engine.py` | DexScreener polling + pump.fun launches, budget-aware, configurable thresholds |
+| SignalEngine | `bot/signal_engine.py` | DexScreener polling (backup discovery) + pump.fun launches, budget-aware, configurable thresholds |
+| pool_events | `bot/pool_events.py` | Pool-creation/token-launch detection from raw transactions -- the primary discovery path (see "Event-driven discovery" below) |
 | InsiderRadar | `bot/insider_radar.py` | First-buyer indexing, wallet scoring, sniper/conviction leaderboards, copy-signal emission, auto-unfollow |
 | RiskManager | `bot/risk_manager.py` | The constitution: position caps, stop/ladder/time-stop math, no averaging down, ever |
 | ExecutionEngine | `bot/execution_engine.py` | Live (real signing/sending) and Paper (haircut-simulated) implementations of the same interface |
@@ -142,8 +143,10 @@ There is exactly one path from "candidate token" to "open position":
 `Orchestrator.evaluate_candidate` -> `TokenSafety.evaluate` ->
 `RiskManager.can_open_position` -> `ExecutionEngine.buy`. Insider
 copy-trades (`Orchestrator.handle_copy_signal`) build a `Candidate` and
-feed it into the exact same function. There is no shortcut for a
-conviction leader's buy.
+feed it into the exact same function -- so does a second-wave
+event-driven entry (`Orchestrator._second_wave_loop`, see "Event-driven
+discovery" in section 6). There is no shortcut for any of them: every
+candidate, from every source, clears the identical `TokenSafety` gate.
 
 ---
 
@@ -551,6 +554,88 @@ sync callback through the default executor instead, so candidate
 evaluation -- however slow -- can no longer be the thing that stalls the
 WebSocket.
 
+### Event-driven discovery + second-wave entry
+
+Discovery's primary path is no longer polling. `Orchestrator._check_pool_creation`
+runs on every transaction InsiderRadar's indexing subscription already
+fetches (Raydium AMM v4 + pump.fun's bonding curve, `logsSubscribe`) --
+zero extra RPC calls, since indexing was already fetching these
+transactions for wallet-activity parsing. `bot/pool_events.py` detects a
+pool-creation or token-launch instruction inside that same transaction
+(see its module docstring for exactly how, and the confidence level
+behind each piece -- Raydium's discriminator is verified against
+Raydium's own source, pump.fun's against pump.fun's own public docs, and
+mint resolution avoids guessing either program's account layout by
+leaning on the SPL Token Program's own reliably-parsed instructions
+instead). Detection-to-database latency is roughly one RPC round-trip
+after the transaction confirms -- realistically under ~1-2s, not a
+30-60s poll interval.
+
+**DexScreener polling is NOT disabled** -- it keeps running exactly as
+before, as the resilience backup: if the WS drops, a creation is missed
+(see pool_events.py's confidence notes), or the RPC-budget-priority
+throttles are dropping most notifications during a busy stretch (the
+SAME throttles indexing already had -- event-driven discovery inherits
+all of them for free, including the kill-switch/backoff/rate-cap/
+calls-per-minute gate in `_indexing_skip_reason`), the pool still
+eventually surfaces once DexScreener lists it.
+
+**Second-wave entry, never at creation.** A detected pool is tracked, not
+evaluated, in `Orchestrator._pending_second_wave`. `_second_wave_loop`
+samples its live price every `second_wave_sample_interval_s` (default
+20s) to build a high-water mark, and only once its age enters
+`[second_wave_min_age_s, second_wave_max_age_s]` (default 3-10 min) does
+it check:
+
+1. Liquidity >= `min_pool_liquidity_usd` (the same floor DexScreener-sourced
+   candidates use).
+2. Price retention >= `second_wave_min_price_retention_pct` (default 40%)
+   of its own high-water mark -- "first dump absorbed," a proxy for "the
+   initial sniper/bot dump already happened and a floor was found," not
+   "still crashing."
+
+A pool that ages past the window without qualifying is dropped,
+untouched -- there is no "buy anyway, it's close enough" fallback. One
+that qualifies is dispatched through `Orchestrator.evaluate_candidate` --
+the *exact* same function every other discovery source uses, so it still
+has to clear the full `TokenSafety` gate; second-wave changes ENTRY
+TIMING, never the safety bar.
+
+**Funnel logging**, per the ask: `pool_creation_detected` (event ->
+tracked), `second_wave_reject` at DEBUG (liquidity/retention filtering,
+with the actual numbers), `second_wave_expired` (aged out untouched),
+`second_wave_dispatch` (-> TokenSafety, whose own `safety_reject`/
+`observe_only_verdict` logs cover the rest of the funnel down to the
+verdict). The heartbeat log's `ws_pool_events_seen` /
+`ws_pool_events_matched` / `second_wave_pending` /
+`second_wave_dispatched_total` / `second_wave_expired_total` /
+`second_wave_rejected_liquidity_total` / `second_wave_rejected_retention_total`
+fields give the running totals every `heartbeat_interval_s` without
+needing to grep.
+
+**Expected event volume -- watch the real numbers, this is a rough
+estimate, not a promise.** pump.fun's daily launch count is highly
+cycle-dependent (order of magnitude: thousands to tens of thousands/day
+network-wide in an active market; historically only a small fraction,
+commonly cited around 1-2%, ever "graduate" to Raydium). Raydium AMM v4's
+own direct (non-pump.fun) pool creations are smaller in count, plausibly
+low hundreds/day network-wide. None of that is what this bot will
+actually SEE: `indexing_max_calls_per_minute` (default 60) caps
+indexing's total getTransaction throughput regardless of how fast
+notifications arrive, and pump.fun's total on-chain transaction volume
+(mostly buys/sells, not creates) almost certainly exceeds what a free RPC
+tier can keep up with -- so `ws_pool_events_seen` is a SAMPLE of network
+activity, not a complete feed, and creation events specifically are a
+small fraction of even that sample. Realistic expectation: `ws_pool_events_matched`
+in the tens-to-low-hundreds/day range, with the number that actually
+survive second-wave filtering into a `second_wave_dispatch` likely
+comparable to or smaller than DexScreener's current volume (single digits
+to low tens/day). If `ws_pool_events_seen` stays at zero for an extended
+stretch while the bot is otherwise healthy, that's the WS subscription
+itself not receiving traffic (check `ws_active_connections`/
+`ws_total_reconnects` in the same heartbeat line) -- not a filtering
+problem.
+
 ---
 
 ## 7. Project tree
@@ -564,7 +649,8 @@ bot/
   solana_wallet.py        keypair loading, raw Ed25519 signing, shortvec helpers, SOL transfer builder
   jupiter_client.py       Jupiter v6 client, slippage doctrine, honeypot sell-simulation
   token_safety.py         every safety check, run on every candidate
-  signal_engine.py        DexScreener + pump.fun polling and filtering
+  signal_engine.py        DexScreener (backup) + pump.fun polling and filtering
+  pool_events.py          pool-creation/token-launch detection -- primary discovery
   insider_radar.py        indexing, wallet scoring, leaderboards, copy-signal emission
   risk_manager.py         position gating, stop/ladder/time-stop math, no-averaging-down
   execution_engine.py     LiveExecutionEngine + PaperExecutionEngine

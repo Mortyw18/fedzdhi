@@ -14,6 +14,7 @@ import logging
 import signal
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 
 from nacl.signing import SigningKey
@@ -36,6 +37,7 @@ from bot.models import (
     WalletBuyRecord,
     WalletSellRecord,
 )
+from bot.pool_events import PoolCreationEvent, detect_pool_creation
 from bot.risk_manager import RiskManager
 from bot.rpc_gateway import RpcGateway, RpcMethodDisabled, RpcOutage, RpcWebSocket
 from bot.signal_engine import SignalEngine
@@ -53,6 +55,22 @@ INDEXED_PROGRAM_IDS = {
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "raydium_amm_v4",
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P": "pumpfun_bonding_curve",
 }
+
+
+@dataclass
+class _PendingPool:
+    """A pool/token detected via event-driven discovery, waiting out the
+    second-wave window (config.second_wave_min_age_s..max_age_s) before
+    it's either evaluated or expires untouched. See
+    Orchestrator._second_wave_loop."""
+
+    mint: str
+    program_id: str
+    created_at: float  # block_time if the tx carried one, else our own detection-time clock
+    high_price_usd: float = 0.0
+    last_price_usd: float = 0.0
+    last_liquidity_usd: float = 0.0
+    samples: int = 0
 
 
 class Orchestrator:
@@ -189,6 +207,18 @@ class Orchestrator:
         # mint -> (cached_at, liquidity_usd at that time, verdict). See
         # _get_cached_verdict / evaluate_candidate.
         self._verdict_cache: dict[str, tuple[float, float, SafetyVerdict]] = {}
+
+        # Event-driven discovery + second-wave entry state. See
+        # _check_pool_creation / _second_wave_loop / config.py's
+        # "event-driven discovery + second-wave entry" section.
+        self._pending_second_wave: dict[str, _PendingPool] = {}
+        self._pool_events_seen = 0          # every notification actually checked (post RPC-budget throttling)
+        self._pool_events_matched = 0       # of those, matched a creation/launch instruction with a resolved mint
+        self._second_wave_dispatched_count = 0
+        self._second_wave_expired_count = 0
+        self._second_wave_rejected_liquidity_count = 0
+        self._second_wave_rejected_retention_count = 0
+
         if config.helius_ws_url:
             self._ws = RpcWebSocket(config.helius_ws_url, logger=self.logger)
 
@@ -416,6 +446,119 @@ class Orchestrator:
                     )
                 )
 
+    # ------------------------------------------------------------------
+    # event-driven discovery + second-wave entry
+    # ------------------------------------------------------------------
+
+    def _check_pool_creation(self, tx: dict, signature: str, program_id: str) -> None:
+        """Runs on the SAME transaction _parse_leader_activity just used --
+        InsiderRadar's indexing subscription already fetches every
+        notification's transaction via getTransaction, so detecting a
+        pool creation/token launch here costs zero additional RPC calls.
+        This is what makes event-driven discovery "free" on top of
+        indexing that was already running, rather than a second parallel
+        subscription duplicating the same traffic.
+
+        See pool_events.py's module docstring for exactly what confidence
+        level the detection itself is built on.
+        """
+        self._pool_events_seen += 1
+        event = detect_pool_creation(tx, signature, program_id)
+        if event is None:
+            return
+        self._pool_events_matched += 1
+
+        if event.mint in self._pending_second_wave or event.mint in self._verdict_cache:
+            return  # already tracking it, or already ran it through TokenSafety this cycle
+
+        if len(self._pending_second_wave) >= self.config.second_wave_max_pending:
+            oldest_mint = min(self._pending_second_wave, key=lambda m: self._pending_second_wave[m].created_at)
+            del self._pending_second_wave[oldest_mint]
+            self.logger.warning(
+                "second_wave_pending_evicted",
+                extra={"fields": {"mint": oldest_mint, "reason": "second_wave_max_pending exceeded"}},
+            )
+
+        created_at = event.block_time or time.time()
+        self._pending_second_wave[event.mint] = _PendingPool(mint=event.mint, program_id=program_id, created_at=created_at)
+        self.logger.info(
+            "pool_creation_detected",
+            extra={"fields": {"mint": event.mint, "program_id": program_id, "signature": signature}},
+        )
+
+    async def _second_wave_loop(self) -> None:
+        """Periodically samples every pending pool's live price (building
+        a high-water mark) and, once its age enters the second-wave
+        window, checks liquidity + price-retention ("first dump
+        absorbed") before dispatching it through the EXACT SAME
+        evaluate_candidate path every other discovery source uses -- no
+        shortcut around TokenSafety for a second-wave candidate.
+        """
+        loop = asyncio.get_running_loop()
+        while not self.stop_event.is_set():
+            await asyncio.sleep(self.config.second_wave_sample_interval_s)
+            now = time.time()
+            expired: list[str] = []
+            dispatched: list[str] = []
+
+            for mint, pending in list(self._pending_second_wave.items()):
+                age_s = now - pending.created_at
+                if age_s > self.config.second_wave_max_age_s:
+                    expired.append(mint)
+                    continue
+
+                candidate = await loop.run_in_executor(None, self.signal_engine.fetch_candidate_by_mint, mint)
+                if candidate is None or candidate.price_usd <= 0:
+                    continue  # not indexed by DexScreener yet (or zero liquidity) -- try again next sample
+
+                pending.last_price_usd = candidate.price_usd
+                pending.last_liquidity_usd = candidate.liquidity_usd
+                pending.high_price_usd = max(pending.high_price_usd, candidate.price_usd)
+                pending.samples += 1
+
+                if age_s < self.config.second_wave_min_age_s:
+                    continue  # too young -- keep sampling to build the high-water mark, don't evaluate yet
+
+                if candidate.liquidity_usd < self.config.min_pool_liquidity_usd:
+                    self._second_wave_rejected_liquidity_count += 1
+                    self.logger.debug(
+                        "second_wave_reject: %s liquidity $%.0f below floor $%.0f",
+                        mint, candidate.liquidity_usd, self.config.min_pool_liquidity_usd,
+                    )
+                    continue
+
+                retention = (pending.last_price_usd / pending.high_price_usd) if pending.high_price_usd > 0 else 0.0
+                if retention < self.config.second_wave_min_price_retention_pct:
+                    self._second_wave_rejected_retention_count += 1
+                    self.logger.debug(
+                        "second_wave_reject: %s price retention %.0f%% below floor %.0f%% (high $%.8f, now $%.8f)",
+                        mint, retention * 100, self.config.second_wave_min_price_retention_pct * 100,
+                        pending.high_price_usd, pending.last_price_usd,
+                    )
+                    continue
+
+                dispatched.append(mint)
+                self._second_wave_dispatched_count += 1
+                self.logger.info(
+                    "second_wave_dispatch",
+                    extra={
+                        "fields": {
+                            "mint": mint, "age_s": round(age_s, 1), "price_retention_pct": round(retention, 4),
+                            "high_price_usd": pending.high_price_usd, "liquidity_usd": candidate.liquidity_usd,
+                            "samples": pending.samples,
+                        }
+                    },
+                )
+                candidate.source = SignalSource.DEXSCREENER
+                await loop.run_in_executor(None, self._on_candidate, candidate)
+
+            for mint in dispatched:
+                del self._pending_second_wave[mint]
+            for mint in expired:
+                self._second_wave_expired_count += 1
+                self.logger.info("second_wave_expired", extra={"fields": {"mint": mint}})
+                del self._pending_second_wave[mint]
+
     def _prune_indexing_call_window(self, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
         cutoff = now - 60.0
@@ -509,6 +652,12 @@ class Orchestrator:
                 self._indexing_rpc_consecutive_failures = 0
                 if tx:
                     self._parse_leader_activity(tx, signature)
+                    if self.config.enable_event_driven_discovery:
+                        # Same already-fetched transaction, no extra RPC
+                        # cost -- see _check_pool_creation's docstring for
+                        # why this rides on indexing's existing
+                        # subscription instead of a separate one.
+                        self._check_pool_creation(tx, signature, program_id)
             except RpcMethodDisabled as exc:
                 # Permanently rejected (403, or a JSON-RPC error that reads
                 # like "not available on this plan") -- RpcGateway already
@@ -619,6 +768,13 @@ class Orchestrator:
                         "indexing_skipped": self._indexing_skipped_count,
                         "indexing_backing_off": self._indexing_backoff_until > time.monotonic(),
                         "rpc_disabled_methods": rpc_stats["disabled_methods"],
+                        "ws_pool_events_seen": self._pool_events_seen,
+                        "ws_pool_events_matched": self._pool_events_matched,
+                        "second_wave_pending": len(self._pending_second_wave),
+                        "second_wave_dispatched_total": self._second_wave_dispatched_count,
+                        "second_wave_expired_total": self._second_wave_expired_count,
+                        "second_wave_rejected_liquidity_total": self._second_wave_rejected_liquidity_count,
+                        "second_wave_rejected_retention_total": self._second_wave_rejected_retention_count,
                     }
                 },
             )
@@ -690,6 +846,8 @@ class Orchestrator:
         if self._ws is not None:
             for program_id in INDEXED_PROGRAM_IDS:
                 tasks.append(asyncio.create_task(self._index_program_loop(program_id)))
+            if self.config.enable_event_driven_discovery:
+                tasks.append(asyncio.create_task(self._second_wave_loop()))
 
         await self.stop_event.wait()
         for t in tasks:

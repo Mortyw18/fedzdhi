@@ -139,6 +139,33 @@ data is a *sample* of on-chain activity, not a complete record, even on a
 long-running, well-connected instance -- treat wallet stats as directionally
 useful, not as an exact trade count.
 
+## Event-driven discovery's detection is a best-effort guess, verified but not proven live
+
+`bot/pool_events.py` decides "this transaction is a pool creation / token
+launch" by matching a byte-level instruction discriminator, and resolves
+the traded mint via the SPL Token Program's own initializeMint
+instructions rather than guessing either program's account layout. Both
+pieces were checked against external sources during development (Raydium's
+own GitHub source for the Initialize2 discriminant; pump.fun's own public
+docs and an independent third-party analysis for the create discriminator
+-- see pool_events.py's module docstring for the specifics and what's
+still unverified, including a possible newer `create_v2` this doesn't
+account for). None of that is the same as having run this against live
+mainnet traffic and confirmed real detections end to end -- it hasn't been,
+as of when this was written.
+
+The failure mode if any of it is wrong is the honest kind, not the
+dangerous kind: a discriminator mismatch means a real launch is silently
+NOT detected (fails closed -- `detect_pool_creation` returns `None`, the
+loop just moves to the next notification); an ambiguous mint resolution
+does the same (`resolve_new_mint` returns `None` rather than guessing,
+so a candidate is never fabricated from a wrong mint). Nothing here can
+produce a WRONG candidate, only a MISSED one. If `ws_pool_events_matched`
+stays near zero for one program while `ws_pool_events_seen` is clearly
+nonzero, that program's detection logic is the first thing to
+re-verify -- and DexScreener polling, still running unchanged as the
+backup path, means a missed detection here is a delay, not a blind spot.
+
 ## What would genuinely surprise us
 
 A result that would be a genuine, non-obvious surprise: the conviction

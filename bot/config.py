@@ -103,11 +103,16 @@ class Config:
     # Cloudflare 530s). After this many consecutive poll failures, SignalEngine
     # stops polling it for the rest of the run rather than retrying forever.
     pumpfun_max_consecutive_failures: int = 5
-    # Manual override: set False to skip pump.fun entirely (e.g. it's been
-    # 530ing for days and you're tired of the circuit breaker re-trying it
-    # every restart). DexScreener signals and InsiderRadar are unaffected.
-    # Also gates TokenSafety's pump.fun graduation lookup (same API).
-    enable_pumpfun_source: bool = True
+    # Confirmed 530-blocked (Cloudflare, origin unreachable) in production
+    # use of this bot -- browser-like headers didn't fix it (see
+    # signal_engine.py's fetch_pumpfun_new_coins), so defaulting to
+    # enabled just means every run wastes pumpfun_max_consecutive_failures
+    # (5) retries against a known-dead endpoint before giving up for the
+    # run. Default now OFF; set ENABLE_PUMPFUN=true in .env to re-enable
+    # if pump.fun's API recovers. DexScreener signals and InsiderRadar are
+    # unaffected either way. Also gates TokenSafety's pump.fun graduation
+    # lookup (same API) -- see check_lp_or_graduation in token_safety.py.
+    enable_pumpfun_source: bool = False
 
     # --- verdict cache ---
     # The same mint gets rediscovered every DexScreener/pump.fun poll cycle
@@ -124,6 +129,44 @@ class Config:
     # state-change subscription per mint.
     verdict_cache_ttl_s: float = 1200.0
     verdict_cache_liquidity_change_pct: float = 0.20
+
+    # --- event-driven discovery + second-wave entry ---
+    # Primary discovery path: WebSocket logsSubscribe on Raydium AMM v4 +
+    # pump.fun's bonding curve program (the same subscription
+    # InsiderRadar's indexing already runs -- see
+    # Orchestrator._check_pool_creation), reacting to a pool-creation/
+    # token-launch instruction within roughly the RPC round-trip latency
+    # of it confirming, not a poll interval. DexScreener polling remains
+    # running unchanged as a resilience backup (see README.md), not
+    # disabled -- if the WS drops or a creation is missed (see
+    # pool_events.py's confidence notes), DexScreener still eventually
+    # surfaces the same pool once it lists it.
+    enable_event_driven_discovery: bool = True
+    # Never buy at creation -- the ENTIRE point of the second-wave
+    # strategy. A newly detected pool is tracked (not evaluated) until its
+    # age is inside [second_wave_min_age_s, second_wave_max_age_s], during
+    # which its price is sampled periodically to build a high-water mark.
+    # Falls out of tracking (never evaluated) if it ages past the window
+    # without qualifying.
+    second_wave_min_age_s: float = 180.0    # 3 min
+    second_wave_max_age_s: float = 600.0    # 10 min
+    # "First dump absorbed": price must have retained at least this
+    # fraction of its own early high by the time it's checked -- a proxy
+    # for "the initial sniper/bot dump already happened and a floor was
+    # found," not "still crashing." 1.0 would require the price to be AT
+    # its all-time high when checked (unrealistic); too low defeats the
+    # point of waiting at all. Tune against second_wave_reject log volume.
+    second_wave_min_price_retention_pct: float = 0.40
+    # How often a pending pool's price is re-sampled during the wait
+    # window, to build the high-water mark used above.
+    second_wave_sample_interval_s: float = 20.0
+    # Safety valve on the pending-pool dict's size: pump.fun alone can
+    # launch far more tokens than this bot could ever second-wave-evaluate
+    # in the same window, especially while RPC-budget-priority throttles
+    # (shared with InsiderRadar's indexing) are dropping most notifications
+    # anyway. Oldest pending entries are evicted first if this is exceeded,
+    # logged loudly -- this is a memory/scale bound, not a real signal.
+    second_wave_max_pending: int = 500
 
     # --- insider radar ---
     insider_first_buyers_n: int = 50
