@@ -127,7 +127,8 @@ why 0.05 SOL is the hard default and 0.1 SOL requires both
 | Solana wallet | `bot/solana_wallet.py` | Keypair loading, raw Ed25519 signing of Jupiter transactions, no external Solana SDK dependency |
 | JupiterClient | `bot/jupiter_client.py` | Jupiter v6 quote/swap, the slippage doctrine formula, sell-simulation for honeypot checks |
 | TokenSafety | `bot/token_safety.py` | The core gate. Every candidate, from either signal source, passes here before any buy |
-| SignalEngine | `bot/signal_engine.py` | DexScreener polling + pump.fun launches, budget-aware, configurable thresholds |
+| SignalEngine | `bot/signal_engine.py` | DexScreener polling (backup discovery) + pump.fun launches, budget-aware, configurable thresholds |
+| pool_events | `bot/pool_events.py` | Pool-creation/token-launch detection from raw transactions -- the primary discovery path (see "Event-driven discovery" below) |
 | InsiderRadar | `bot/insider_radar.py` | First-buyer indexing, wallet scoring, sniper/conviction leaderboards, copy-signal emission, auto-unfollow |
 | RiskManager | `bot/risk_manager.py` | The constitution: position caps, stop/ladder/time-stop math, no averaging down, ever |
 | ExecutionEngine | `bot/execution_engine.py` | Live (real signing/sending) and Paper (haircut-simulated) implementations of the same interface |
@@ -142,8 +143,10 @@ There is exactly one path from "candidate token" to "open position":
 `Orchestrator.evaluate_candidate` -> `TokenSafety.evaluate` ->
 `RiskManager.can_open_position` -> `ExecutionEngine.buy`. Insider
 copy-trades (`Orchestrator.handle_copy_signal`) build a `Candidate` and
-feed it into the exact same function. There is no shortcut for a
-conviction leader's buy.
+feed it into the exact same function -- so does a second-wave
+event-driven entry (`Orchestrator._second_wave_loop`, see "Event-driven
+discovery" in section 6). There is no shortcut for any of them: every
+candidate, from every source, clears the identical `TokenSafety` gate.
 
 ---
 
@@ -254,6 +257,7 @@ Telegram (`bot/alerter.py::Alerter.enabled`).
 | `TELEGRAM_CHAT_ID` | Required if `TELEGRAM_BOT_TOKEN` is set | The chat Telegram alerts are sent to. |
 | `BANKROLL_SOL` | Recommended | Feeds the ruin table and the position-size-vs-bankroll checks in `Config.validate()`. Set it to what you actually funded. |
 | `DB_PATH` | Optional | SQLite ledger path. Defaults to `data/bot.db`. |
+| `ENABLE_PUMPFUN` | Optional | Set to `false` to skip pump.fun entirely (its API 530ing for extended stretches is common; this stops the circuit breaker wasting retries on it every restart). DexScreener signals and InsiderRadar are unaffected. Default `true`. |
 
 Once `.env` is filled in, sanity-check that it loads correctly without
 starting any run that touches RPC or a wallet:
@@ -405,14 +409,232 @@ program could trip it within seconds of startup -- even against a
 perfectly healthy RPC endpoint -- just because notifications arrived
 faster than 3 consecutive failures could otherwise happen. Indexing is
 best-effort learning, not a trade waiting on a price, so its RPC failures
-now degrade locally (logged with the method name and error, then a short
-self-throttle after enough consecutive failures -- see
-`indexing_max_consecutive_rpc_failures` / `indexing_rpc_failure_cooldown_s`
-in `config.py`) and never touch the kill switch at all. The RPC-outage
-counter is fed exclusively by `TokenSafety`'s verdicts inside
-`evaluate_candidate` now -- the actual price-critical path a buy is gated
-on -- and only when a verdict's *failing* checks carry TokenSafety's own
-`"rpc error: "` detail prefix, never for an ordinary rejection.
+now degrade locally and never touch the kill switch at all -- see
+"Indexing's own backoff" below for exactly how. The RPC-outage counter is
+fed exclusively by `TokenSafety`'s verdicts inside `evaluate_candidate`
+now -- the actual price-critical path a buy is gated on -- and only when a
+verdict's *failing* checks carry TokenSafety's own `"rpc error: "` detail
+prefix, never for an ordinary rejection.
+
+### Indexing's own backoff, and why it isn't scoped to "just our candidates"
+
+A follow-up report showed `indexing_rpc_failure` logging several times a
+second with a fixed 30s cooldown doing little to stop it. Two rounds of
+fixes:
+
+**First round**: a hard local rate cap (`indexing_min_call_interval_s`,
+default 0.5s) on the indexer's own `getTransaction` calls, and exponential
+(not flat) backoff once a consecutive-failure threshold was crossed.
+
+**This didn't actually fix it.** A follow-up report showed
+`indexing_rpc_failure` *still* logging every 1-3s continuously, not
+growing. Two real bugs, both now fixed:
+
+- **The backoff and rate-cap state was per-loop, but Orchestrator runs TWO
+  concurrent indexing loops** (one per entry in `INDEXED_PROGRAM_IDS` --
+  Raydium AMM v4 and pump.fun's bonding curve). One program's loop backing
+  off did nothing to stop the OTHER program's loop from continuing to fail
+  on its own independent schedule at the same time -- from the logs, two
+  loops each failing every ~3-4s but offset from each other looks
+  identical to "no backoff at all, failing every 1-3s." All of this state
+  (`indexing_min_call_interval_s`'s spacing, the backoff window, and a new
+  `indexing_max_calls_per_minute` cap) is now genuinely global: every
+  concurrent indexing loop checks and shares the SAME `_indexing_skip_reason()`
+  gate before every notification, so one loop's failure now stops every
+  other loop's attempts too, immediately.
+- **`RpcGateway.call()`'s own internal retry loop (3 attempts by default,
+  with sleeps between) was running on top of indexing's separate backoff
+  on every single call**, adding up to ~1.5s of retry-internal wall time
+  per failing notification regardless of what indexing's own backoff
+  thought it was doing. Indexing now passes `max_retries=1` to `call()`
+  for `getTransaction`, so its own exponential backoff -- now starting
+  from the very FIRST failure, not after a grace threshold, doubling every
+  consecutive failure (`indexing_rpc_failure_backoff_base_s=2.0s` up to
+  `indexing_rpc_failure_backoff_max_s=60.0s`) -- is the sole authority over
+  retry timing for this call site.
+
+Also added: **permanent method rejection detection.** A 403 from the
+provider, or a JSON-RPC error that reads like "method not available on
+this plan," now disables that method in `RpcGateway` for the rest of the
+run -- every subsequent call to it fails instantly, with zero network I/O,
+instead of paying a full retry cycle forever. `rpc_method_disabled` logs
+once when this happens; `--daily-report` / the heartbeat log's
+`rpc_disabled_methods` field show what's currently disabled.
+
+A third ask -- "index forward from new pool creations instead of broad
+program-wide scans" -- is *not* implemented, deliberately, and it's worth
+explaining why rather than silently skipping it. `logsSubscribe(mentions=
+[program_id])` really is a firehose (most swap activity network-wide on
+that AMM program, not just pools we care about), but InsiderRadar's actual
+purpose is building wallet-level conviction scores from a wallet's trading
+history across *many* tokens -- most of which we'd never discover as our
+own candidates (a wallet's edge is often entering tokens well before they'd
+pass SignalEngine's own liquidity/volume filters). Narrowing indexing to
+"only subscribe to mints we've discovered ourselves" would structurally
+break that: `conviction_min_distinct_tokens=15` could never be satisfied by
+a wallet if we only ever observed it trading inside our own candidate
+list. A real "index from pool creation" feature would need to detect pool
+*creation* instructions specifically (Raydium's `initialize2`, pump.fun's
+`create`, ...) by parsing program logs -- log formats that aren't
+officially documented and differ per DEX, where a subtly wrong parse fails
+silently (missed or mis-attributed events) rather than crashing loudly.
+That's real, valuable work, but it deserves its own pass against actual
+recorded transaction logs, not a guess shipped alongside four other fixes
+in the same sitting. The rate cap and exponential backoff above are the
+responsible way to keep the necessarily-broad subscription affordable in
+the meantime.
+
+### Two safety checks that could never actually pass, fixed
+
+A separate report showed every candidate rejecting with the identical two
+reasons -- `honeypot: sell simulation reverted: AccountNotFound` and
+`lp_burned_or_graduated: no LP mint known and token is not an un-graduated
+pump.fun token`. Both were structural, not calibration problems:
+
+- **`check_honeypot`** used to build a real sell transaction and
+  `simulateTransaction` it, which needs the wallet to already hold the
+  token (a funded associated token account) -- something that's never true
+  pre-buy. Every candidate failed with `AccountNotFound`, honeypot or not;
+  the check could not pass on ANY token. It's now a three-signal proxy
+  instead: a Jupiter sell-side route quote (a price lookup, doesn't
+  require holding anything), real observed sell volume in the last 5
+  minutes for DexScreener-sourced candidates (pump.fun's coin feed doesn't
+  expose this, so pump.fun-sourced candidates skip that specific signal),
+  and no active Token-2022 `transferHook` extension (the most common real
+  honeypot mechanism on current launches -- it can silently block a sell
+  that a quote alone would never catch, and costs zero extra RPC calls
+  since it reuses the mint account TokenSafety already fetched for the
+  mint/freeze-authority check). None of this proves a token is safe to
+  sell; it proves the cheapest signals a free RPC tier can afford didn't
+  fire.
+- **`check_lp_or_graduation`** rejected essentially every DexScreener-
+  sourced candidate, pump.fun-origin or not: `lp_mint` is never populated
+  by DexScreener discovery, and `Candidate.pump_fun_graduated` is only
+  ever set by SignalEngine's own pump.fun poller, never when the same
+  token is discovered via DexScreener's token-profiles/boosts. A mint
+  ending in pump.fun's vanity suffix (`"...pump"`) now gets its
+  bonding-curve/graduation state resolved directly from pump.fun's own API
+  instead. A lookup failure is treated as *unknown*, not a reject -- the
+  verdict cache (below) means the candidate gets a fresh attempt on a
+  later cycle rather than being permanently blocked by one bad request,
+  and pump.fun going down isn't something a bad-actor token can force on
+  demand to slip past this one check while every other check still
+  applies. Non-pump.fun DEX-native launches are unchanged and still fail
+  closed: resolving an arbitrary Raydium/Orca/Meteora pool's LP mint would
+  need per-DEX binary account-layout decoding this bot doesn't do.
+
+### Verdict cache: stop re-checking the same mint every cycle
+
+DexScreener rediscovers the same actively-trending mints every poll cycle
+by design -- without a cache, `evaluate_candidate` reran the full, RPC/
+Jupiter/rugcheck/pump.fun-lookup-costing safety pipeline on the same mint
+forever. `verdict_cache_ttl_s` (default 20 min) now short-circuits a
+rediscovery of a still-cached mint before any of that runs. Two things
+deliberately bypass the cache early: a big swing in the candidate's own
+reported liquidity (`verdict_cache_liquidity_change_pct`, default 20%,
+cheap since it's data SignalEngine already handed over) is treated as a
+state-change event, and a verdict whose rejection came from an RPC error
+(not a real pass/fail) is never cached at all -- caching "unknown because
+the RPC hiccuped" would suppress a retry for the full TTL exactly when a
+fresh attempt is most wanted, and would also mask a genuinely sustained
+outage from ever reaching `KillSwitch.set_rpc_outage`'s threshold.
+
+### A WebSocket 1011 can be self-inflicted
+
+A separate question worth a real answer rather than a guess: "is a 1011
+(server-side timeout) close code our own saturation, or Helius's?" It was
+ours. `SignalEngine._dispatch` used to call `Orchestrator._on_candidate`
+directly on the event loop -- and `evaluate_candidate` makes several
+blocking `requests` calls (RPC, Jupiter, rugcheck, pump.fun graduation).
+While one of those was running, the event loop couldn't service
+`RpcWebSocket`'s ping/pong keepalive or read the next `logsSubscribe`
+frame at all -- exactly the kind of client-side starvation that causes a
+server to eventually give up and close with 1011. `_dispatch` now runs a
+sync callback through the default executor instead, so candidate
+evaluation -- however slow -- can no longer be the thing that stalls the
+WebSocket.
+
+### Event-driven discovery + second-wave entry
+
+Discovery's primary path is no longer polling. `Orchestrator._check_pool_creation`
+runs on every transaction InsiderRadar's indexing subscription already
+fetches (Raydium AMM v4 + pump.fun's bonding curve, `logsSubscribe`) --
+zero extra RPC calls, since indexing was already fetching these
+transactions for wallet-activity parsing. `bot/pool_events.py` detects a
+pool-creation or token-launch instruction inside that same transaction
+(see its module docstring for exactly how, and the confidence level
+behind each piece -- Raydium's discriminator is verified against
+Raydium's own source, pump.fun's against pump.fun's own public docs, and
+mint resolution avoids guessing either program's account layout by
+leaning on the SPL Token Program's own reliably-parsed instructions
+instead). Detection-to-database latency is roughly one RPC round-trip
+after the transaction confirms -- realistically under ~1-2s, not a
+30-60s poll interval.
+
+**DexScreener polling is NOT disabled** -- it keeps running exactly as
+before, as the resilience backup: if the WS drops, a creation is missed
+(see pool_events.py's confidence notes), or the RPC-budget-priority
+throttles are dropping most notifications during a busy stretch (the
+SAME throttles indexing already had -- event-driven discovery inherits
+all of them for free, including the kill-switch/backoff/rate-cap/
+calls-per-minute gate in `_indexing_skip_reason`), the pool still
+eventually surfaces once DexScreener lists it.
+
+**Second-wave entry, never at creation.** A detected pool is tracked, not
+evaluated, in `Orchestrator._pending_second_wave`. `_second_wave_loop`
+samples its live price every `second_wave_sample_interval_s` (default
+20s) to build a high-water mark, and only once its age enters
+`[second_wave_min_age_s, second_wave_max_age_s]` (default 3-10 min) does
+it check:
+
+1. Liquidity >= `min_pool_liquidity_usd` (the same floor DexScreener-sourced
+   candidates use).
+2. Price retention >= `second_wave_min_price_retention_pct` (default 40%)
+   of its own high-water mark -- "first dump absorbed," a proxy for "the
+   initial sniper/bot dump already happened and a floor was found," not
+   "still crashing."
+
+A pool that ages past the window without qualifying is dropped,
+untouched -- there is no "buy anyway, it's close enough" fallback. One
+that qualifies is dispatched through `Orchestrator.evaluate_candidate` --
+the *exact* same function every other discovery source uses, so it still
+has to clear the full `TokenSafety` gate; second-wave changes ENTRY
+TIMING, never the safety bar.
+
+**Funnel logging**, per the ask: `pool_creation_detected` (event ->
+tracked), `second_wave_reject` at DEBUG (liquidity/retention filtering,
+with the actual numbers), `second_wave_expired` (aged out untouched),
+`second_wave_dispatch` (-> TokenSafety, whose own `safety_reject`/
+`observe_only_verdict` logs cover the rest of the funnel down to the
+verdict). The heartbeat log's `ws_pool_events_seen` /
+`ws_pool_events_matched` / `second_wave_pending` /
+`second_wave_dispatched_total` / `second_wave_expired_total` /
+`second_wave_rejected_liquidity_total` / `second_wave_rejected_retention_total`
+fields give the running totals every `heartbeat_interval_s` without
+needing to grep.
+
+**Expected event volume -- watch the real numbers, this is a rough
+estimate, not a promise.** pump.fun's daily launch count is highly
+cycle-dependent (order of magnitude: thousands to tens of thousands/day
+network-wide in an active market; historically only a small fraction,
+commonly cited around 1-2%, ever "graduate" to Raydium). Raydium AMM v4's
+own direct (non-pump.fun) pool creations are smaller in count, plausibly
+low hundreds/day network-wide. None of that is what this bot will
+actually SEE: `indexing_max_calls_per_minute` (default 60) caps
+indexing's total getTransaction throughput regardless of how fast
+notifications arrive, and pump.fun's total on-chain transaction volume
+(mostly buys/sells, not creates) almost certainly exceeds what a free RPC
+tier can keep up with -- so `ws_pool_events_seen` is a SAMPLE of network
+activity, not a complete feed, and creation events specifically are a
+small fraction of even that sample. Realistic expectation: `ws_pool_events_matched`
+in the tens-to-low-hundreds/day range, with the number that actually
+survive second-wave filtering into a `second_wave_dispatch` likely
+comparable to or smaller than DexScreener's current volume (single digits
+to low tens/day). If `ws_pool_events_seen` stays at zero for an extended
+stretch while the bot is otherwise healthy, that's the WS subscription
+itself not receiving traffic (check `ws_active_connections`/
+`ws_total_reconnects` in the same heartbeat line) -- not a filtering
+problem.
 
 ---
 
@@ -427,7 +649,8 @@ bot/
   solana_wallet.py        keypair loading, raw Ed25519 signing, shortvec helpers, SOL transfer builder
   jupiter_client.py       Jupiter v6 client, slippage doctrine, honeypot sell-simulation
   token_safety.py         every safety check, run on every candidate
-  signal_engine.py        DexScreener + pump.fun polling and filtering
+  signal_engine.py        DexScreener (backup) + pump.fun polling and filtering
+  pool_events.py          pool-creation/token-launch detection -- primary discovery
   insider_radar.py        indexing, wallet scoring, leaderboards, copy-signal emission
   risk_manager.py         position gating, stop/ladder/time-stop math, no-averaging-down
   execution_engine.py     LiveExecutionEngine + PaperExecutionEngine

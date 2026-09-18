@@ -411,9 +411,31 @@ class SignalEngine:
     # ------------------------------------------------------------------
 
     async def _dispatch(self, callback: CandidateCallback, candidate: Candidate) -> None:
-        result = callback(candidate)
-        if asyncio.iscoroutine(result):
-            await result
+        """A sync callback (Orchestrator._on_candidate, in practice) runs in
+        the default executor, NOT directly on this event loop.
+
+        evaluate_candidate() makes several blocking `requests` calls
+        (TokenSafety's RPC/Jupiter/rugcheck/pump.fun-graduation lookups) --
+        calling it straight from here would block the entire event loop for
+        however long that takes, which starves EVERYTHING else sharing it,
+        including RpcWebSocket's ping/pong keepalive and its next
+        logsSubscribe frame read. That starvation is the leading suspect
+        for a WebSocket dropping with close code 1011 (a server-side
+        "you stopped responding" timeout) under load: it looks like Helius's
+        side, but it can just as easily be ours. Running the callback off
+        the loop keeps candidate evaluation from ever being able to cause
+        that, regardless of how slow a single evaluate() call is.
+
+        A coroutine-function callback (none currently exist, but the type
+        alias has always allowed one) is awaited directly instead, since it
+        cooperates with the loop by construction and forcing it into a
+        thread would be pointless.
+        """
+        if asyncio.iscoroutinefunction(callback):
+            await callback(candidate)
+        else:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, callback, candidate)
 
     async def run_dexscreener_loop(self, callback: CandidateCallback, stop_event: Optional[asyncio.Event] = None) -> None:
         loop = asyncio.get_running_loop()

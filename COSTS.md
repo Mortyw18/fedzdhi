@@ -51,6 +51,41 @@ free-tier RPC budget, not just to survive an occasional spike:
   rate-limit episode from turning into the death spiral of "every caller
   retries a few times, which trips the limit further, which makes every
   caller retry again."
+- **A per-mint verdict cache stops repeat evaluation, not just repeat
+  RPC calls.** DexScreener rediscovers the same actively-trending mints
+  every poll cycle by design. Without a cache, `evaluate_candidate` reran
+  the ENTIRE safety pipeline -- RPC, Jupiter, rugcheck, and pump.fun's
+  graduation API -- on the same mint every single cycle, forever.
+  `verdict_cache_ttl_s` (default 20 min) means a rediscovered mint short-
+  circuits before any of that spends a single call, with a cache-bypass
+  on a large liquidity swing or an RPC-error verdict (see HONESTY.md and
+  README.md's "Verdict cache" section for why those two cases skip the
+  cache). This is the single biggest lever on RPC budget when
+  `--daily-report` shows a high `safety_checks` count relative to
+  `signals` -- if they're close to equal, the cache isn't doing its job
+  (check `verdict_cache_ttl_s` and `verdict_cache_liquidity_change_pct`).
+- **Indexing has its own rate cap, calls/min ceiling, and exponential
+  backoff, all shared globally across every concurrent indexing loop** --
+  separate from and in addition to the RPC-budget-ceiling throttle above
+  -- see README.md's "Indexing's own backoff" section. None of the three
+  cost a single `RpcGateway.call()` when they trigger; all three exist
+  specifically to stop a sustained RPC outage from turning into a tight
+  retry loop the same way the 429 cooldown above does for rate limiting
+  specifically. Indexing's `getTransaction` calls also pass
+  `max_retries=1` to `RpcGateway.call()` -- indexing runs its own separate
+  backoff across repeated calls, and letting `RpcGateway`'s own internal
+  retry loop (3 attempts by default) also fire on every single call was
+  costing up to ~1.5s of extra retry time per failure regardless of what
+  indexing's own backoff was doing.
+- **A method RpcGateway detects as permanently rejected (403, or a
+  JSON-RPC error that reads like "not available on this plan") is
+  disabled for the rest of the run.** Every subsequent call to it fails
+  instantly, with zero network I/O -- this matters most for a Helius free
+  tier, where some enhanced/paid-tier-only methods return exactly this
+  shape of error, and retrying one forever on every single call would
+  otherwise burn budget and time for no possible benefit. `rpc_method_disabled`
+  logs once when this happens; `disabled_methods` in `get_call_stats()` /
+  `--daily-report` shows what's currently off.
 
 The RPC budget itself is audited, not just capped: `RpcGateway` tracks
 per-method call counts and calls-per-minute live, and the running bot
@@ -67,9 +102,9 @@ not to loosen the budget tracker's own limit.
 
 `RpcGateway`'s budget tracker only counts calls that actually go through
 `RpcGateway.call()` -- and only two things in this codebase ever do
-that: `TokenSafety`'s checks (mint/holder/LP/honeypot) and InsiderRadar's
-indexing loop's `getTransaction` lookups. Two entire, load-bearing parts
-of the pipeline never touch it at all, by design:
+that: `TokenSafety`'s RPC-backed checks (mint/holder/LP-burn) and
+InsiderRadar's indexing loop's `getTransaction` lookups. Several other
+load-bearing parts of the pipeline never touch it at all, by design:
 
 - **DexScreener polling** uses `SignalEngine`'s own `requests.Session`,
   talking directly to `api.dexscreener.com` -- not Helius, not
@@ -79,6 +114,19 @@ of the pipeline never touch it at all, by design:
   JSON-RPC framing over that socket. It never calls `RpcGateway.call()`
   either, so `logsSubscribe` traffic doesn't touch the HTTP budget
   tracker regardless of how many notifications arrive.
+- **`check_lp_or_graduation`'s pump.fun graduation lookup, `check_honeypot`'s
+  Jupiter sell-route quote, and `check_rugcheck_secondary`** all go through
+  their own `requests.Session`s (pump.fun's coin API, Jupiter's quote API,
+  RugCheck) -- none of them touch `RpcGateway` either, same as DexScreener
+  and pump.fun's coin-discovery polling above.
+- **Event-driven pool-creation detection costs zero additional RPC calls.**
+  `Orchestrator._check_pool_creation` runs on the SAME transaction the
+  indexing loop already fetched via `getTransaction` for wallet-activity
+  parsing -- it's a second thing done with data already paid for, not a
+  second subscription or a second RPC round-trip. Second-wave's periodic
+  price sampling (`_second_wave_loop`, `SignalEngine.fetch_candidate_by_mint`)
+  also never touches `RpcGateway` -- it's the same DexScreener
+  `requests.Session` as everything else DexScreener-sourced.
 
 So if `TokenSafety.evaluate()` was never invoked (no candidate ever
 passed SignalEngine's filters) and the indexing loop never got as far as

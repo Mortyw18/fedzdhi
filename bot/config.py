@@ -103,10 +103,70 @@ class Config:
     # Cloudflare 530s). After this many consecutive poll failures, SignalEngine
     # stops polling it for the rest of the run rather than retrying forever.
     pumpfun_max_consecutive_failures: int = 5
-    # Manual override: set False to skip pump.fun entirely (e.g. it's been
-    # 530ing for days and you're tired of the circuit breaker re-trying it
-    # every restart). DexScreener signals and InsiderRadar are unaffected.
-    enable_pumpfun_source: bool = True
+    # Confirmed 530-blocked (Cloudflare, origin unreachable) in production
+    # use of this bot -- browser-like headers didn't fix it (see
+    # signal_engine.py's fetch_pumpfun_new_coins), so defaulting to
+    # enabled just means every run wastes pumpfun_max_consecutive_failures
+    # (5) retries against a known-dead endpoint before giving up for the
+    # run. Default now OFF; set ENABLE_PUMPFUN=true in .env to re-enable
+    # if pump.fun's API recovers. DexScreener signals and InsiderRadar are
+    # unaffected either way. Also gates TokenSafety's pump.fun graduation
+    # lookup (same API) -- see check_lp_or_graduation in token_safety.py.
+    enable_pumpfun_source: bool = False
+
+    # --- verdict cache ---
+    # The same mint gets rediscovered every DexScreener/pump.fun poll cycle
+    # (DexScreener always returns still-active pools; the whole point of a
+    # trend-following search is that it keeps finding what's already
+    # trending) -- without a cache, evaluate_candidate() re-runs the full,
+    # RPC/Jupiter/rugcheck/pump.fun-lookup-costing safety pipeline on the
+    # SAME mint every single cycle, forever. 20 minutes covers several
+    # DexScreener poll intervals without leaving genuinely stale data cached
+    # for too long. A big swing in the candidate's own reported liquidity
+    # (verdict_cache_liquidity_change_pct) is treated as a state-change event
+    # and bypasses the cache early even inside the TTL -- cheap to check
+    # (data we already have from discovery) and cheaper than a real
+    # state-change subscription per mint.
+    verdict_cache_ttl_s: float = 1200.0
+    verdict_cache_liquidity_change_pct: float = 0.20
+
+    # --- event-driven discovery + second-wave entry ---
+    # Primary discovery path: WebSocket logsSubscribe on Raydium AMM v4 +
+    # pump.fun's bonding curve program (the same subscription
+    # InsiderRadar's indexing already runs -- see
+    # Orchestrator._check_pool_creation), reacting to a pool-creation/
+    # token-launch instruction within roughly the RPC round-trip latency
+    # of it confirming, not a poll interval. DexScreener polling remains
+    # running unchanged as a resilience backup (see README.md), not
+    # disabled -- if the WS drops or a creation is missed (see
+    # pool_events.py's confidence notes), DexScreener still eventually
+    # surfaces the same pool once it lists it.
+    enable_event_driven_discovery: bool = True
+    # Never buy at creation -- the ENTIRE point of the second-wave
+    # strategy. A newly detected pool is tracked (not evaluated) until its
+    # age is inside [second_wave_min_age_s, second_wave_max_age_s], during
+    # which its price is sampled periodically to build a high-water mark.
+    # Falls out of tracking (never evaluated) if it ages past the window
+    # without qualifying.
+    second_wave_min_age_s: float = 180.0    # 3 min
+    second_wave_max_age_s: float = 600.0    # 10 min
+    # "First dump absorbed": price must have retained at least this
+    # fraction of its own early high by the time it's checked -- a proxy
+    # for "the initial sniper/bot dump already happened and a floor was
+    # found," not "still crashing." 1.0 would require the price to be AT
+    # its all-time high when checked (unrealistic); too low defeats the
+    # point of waiting at all. Tune against second_wave_reject log volume.
+    second_wave_min_price_retention_pct: float = 0.40
+    # How often a pending pool's price is re-sampled during the wait
+    # window, to build the high-water mark used above.
+    second_wave_sample_interval_s: float = 20.0
+    # Safety valve on the pending-pool dict's size: pump.fun alone can
+    # launch far more tokens than this bot could ever second-wave-evaluate
+    # in the same window, especially while RPC-budget-priority throttles
+    # (shared with InsiderRadar's indexing) are dropping most notifications
+    # anyway. Oldest pending entries are evicted first if this is exceeded,
+    # logged loudly -- this is a memory/scale bound, not a real signal.
+    second_wave_max_pending: int = 500
 
     # --- insider radar ---
     insider_first_buyers_n: int = 50
@@ -140,12 +200,40 @@ class Config:
     # Indexing's own RPC failures (getTransaction on a logsSubscribe
     # notification) must degrade gracefully and never touch the kill switch
     # -- that's reserved for TokenSafety's price-critical checks (see
-    # KillSwitch's module docstring). Instead, after this many consecutive
-    # getTransaction failures the indexer pauses itself for
-    # indexing_rpc_failure_cooldown_s before trying again, so a real outage
-    # self-throttles instead of hammering the endpoint on every notification.
-    indexing_max_consecutive_rpc_failures: int = 5
-    indexing_rpc_failure_cooldown_s: float = 30.0
+    # KillSwitch's module docstring). Every throttle below is GLOBAL/SHARED
+    # across every concurrent indexing loop (Orchestrator runs one per
+    # indexed program ID, see INDEXED_PROGRAM_IDS) -- per-loop state was
+    # tried first and doesn't work: one program's loop backing off did
+    # nothing to stop the OTHER program's loop from continuing to fail on
+    # its own independent schedule at the same time, which from the logs
+    # looked exactly like "no backoff at all, fixed-interval retries."
+    #
+    # Backoff grows exponentially on every consecutive getTransaction
+    # failure (base * 2^(consecutive-1), capped), starting on the very
+    # first failure -- not after a grace threshold. A flat or
+    # threshold-gated cooldown wasn't enough under real load: a busy AMM
+    # program firing notifications several times a second needs the pause
+    # to start immediately and keep growing for as long as the outage
+    # actually persists.
+    indexing_rpc_failure_backoff_base_s: float = 2.0
+    indexing_rpc_failure_backoff_max_s: float = 60.0
+    # A hard, local floor on the spacing between the indexer's OWN
+    # getTransaction attempts -- independent of how fast logsSubscribe
+    # notifications actually arrive, how the RPC budget ceiling above is
+    # doing, or the exponential backoff. "Several notifications a second"
+    # from a busy program can never turn into "several RPC calls a second"
+    # from this loop, full stop, even on the very first burst before any of
+    # the other throttles have had a chance to kick in.
+    indexing_min_call_interval_s: float = 0.5
+    # A second, independent ceiling: no more than this many getTransaction
+    # ATTEMPTS (successful or not) from indexing, combined across every
+    # program's loop, in any trailing 60s window. Where the interval floor
+    # above bounds the SPACING between calls, this bounds the total VOLUME
+    # -- a genuinely sustained outage backing off exponentially can still
+    # rack up a lot of near-instant attempts early on before the backoff
+    # has grown large; this caps that regardless of what the backoff level
+    # currently is.
+    indexing_max_calls_per_minute: int = 60
     # How often the running bot snapshots RpcGateway's call stats into
     # Accounting, so `--daily-report` can show the RPC budget after the
     # fact even though that one-shot command never starts a live gateway.
@@ -310,6 +398,14 @@ def load_config_from_env(env_path: str = ".env") -> Config:
     cfg.telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     cfg.db_path = os.environ.get("DB_PATH", cfg.db_path)
+    # Previously only settable by constructing Config() directly in Python
+    # (e.g. tests) -- there was no actual way to turn pump.fun off from
+    # .env, despite enable_pumpfun_source existing as a Config field since
+    # the circuit-breaker was added. Any of "false"/"0"/"no" (any case)
+    # disables it; anything else (including unset) leaves the default True.
+    enable_pumpfun_env = os.environ.get("ENABLE_PUMPFUN")
+    if enable_pumpfun_env is not None:
+        cfg.enable_pumpfun_source = enable_pumpfun_env.strip().lower() not in ("false", "0", "no")
     return cfg
 
 

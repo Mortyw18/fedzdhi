@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
-from bot.config import Config, ConfigError
+from bot.config import Config, ConfigError, load_config_from_env
 from bot.models import Mode
 
 
@@ -84,3 +86,46 @@ def test_observe_only_with_rpc_url_is_valid():
 def test_observe_only_cannot_combine_with_live():
     with pytest.raises(ConfigError):
         Config(mode=Mode.LIVE, observe_only=True, helius_api_key="test-key").validate()
+
+
+# ----------------------------------------------------------------------
+# ENABLE_PUMPFUN env var -- previously enable_pumpfun_source existed as a
+# Config field but had no actual way to be set from .env, despite the
+# pump.fun 530 circuit breaker/config-flag being documented as the fix.
+# ----------------------------------------------------------------------
+
+
+def _clear_env(monkeypatch, *names):
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_enable_pumpfun_defaults_false_when_unset(tmp_path, monkeypatch):
+    """pump.fun's API was confirmed 530-blocked in production use of this
+    bot -- defaulting to enabled just wasted 5 retries against a
+    known-dead endpoint every single run."""
+    _clear_env(monkeypatch, "ENABLE_PUMPFUN")
+    cfg = load_config_from_env(str(tmp_path / "nonexistent.env"))
+    assert cfg.enable_pumpfun_source is False
+
+
+@pytest.mark.parametrize("value", ["false", "False", "FALSE", "0", "no", "No"])
+def test_enable_pumpfun_false_values_disable_it(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("ENABLE_PUMPFUN", value)
+    cfg = load_config_from_env(str(tmp_path / "nonexistent.env"))
+    assert cfg.enable_pumpfun_source is False
+
+
+@pytest.mark.parametrize("value", ["true", "True", "1", "yes"])
+def test_enable_pumpfun_true_like_values_keep_it_enabled(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("ENABLE_PUMPFUN", value)
+    cfg = load_config_from_env(str(tmp_path / "nonexistent.env"))
+    assert cfg.enable_pumpfun_source is True
+
+
+def test_enable_pumpfun_from_dotenv_file(tmp_path, monkeypatch):
+    _clear_env(monkeypatch, "ENABLE_PUMPFUN")
+    env_file = tmp_path / ".env"
+    env_file.write_text("ENABLE_PUMPFUN=false\n")
+    cfg = load_config_from_env(str(env_file))
+    assert cfg.enable_pumpfun_source is False

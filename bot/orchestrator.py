@@ -12,6 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 
 from nacl.signing import SigningKey
@@ -29,12 +32,14 @@ from bot.models import (
     CopySignal,
     Mode,
     Position,
+    SafetyVerdict,
     SignalSource,
     WalletBuyRecord,
     WalletSellRecord,
 )
+from bot.pool_events import PoolCreationEvent, detect_pool_creation
 from bot.risk_manager import RiskManager
-from bot.rpc_gateway import RpcGateway, RpcOutage, RpcWebSocket
+from bot.rpc_gateway import RpcGateway, RpcMethodDisabled, RpcOutage, RpcWebSocket
 from bot.signal_engine import SignalEngine
 from bot.solana_wallet import Wallet, load_wallet_from_env
 from bot.token_safety import TokenSafety
@@ -50,6 +55,22 @@ INDEXED_PROGRAM_IDS = {
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "raydium_amm_v4",
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P": "pumpfun_bonding_curve",
 }
+
+
+@dataclass
+class _PendingPool:
+    """A pool/token detected via event-driven discovery, waiting out the
+    second-wave window (config.second_wave_min_age_s..max_age_s) before
+    it's either evaluated or expires untouched. See
+    Orchestrator._second_wave_loop."""
+
+    mint: str
+    program_id: str
+    created_at: float  # block_time if the tx carried one, else our own detection-time clock
+    high_price_usd: float = 0.0
+    last_price_usd: float = 0.0
+    last_liquidity_usd: float = 0.0
+    samples: int = 0
 
 
 class Orchestrator:
@@ -104,6 +125,7 @@ class Orchestrator:
             max_top10_holder_pct=config.max_top10_holder_pct,
             max_acceptable_price_impact_pct=config.max_acceptable_price_impact_pct,
             bundled_launch_min_distinct_tokens=config.bundled_launch_min_distinct_tokens,
+            enable_pumpfun_lookups=config.enable_pumpfun_source,
             logger=self.logger,
         )
         self.signal_engine = SignalEngine(
@@ -171,10 +193,32 @@ class Orchestrator:
         self._token_decimals_cache: dict[str, int] = {}
         self._ws: Optional[RpcWebSocket] = None
         self._indexing_skipped_count = 0
-        # Local, kill-switch-independent degrade for indexing's own RPC
-        # failures -- see _index_program_loop and KillSwitch's module
-        # docstring for why this must never call kill_switch.set_rpc_outage.
+        # Kill-switch-independent degrade for indexing's own RPC failures --
+        # see _index_program_loop and KillSwitch's module docstring for why
+        # this must never call kill_switch.set_rpc_outage. ALL of this is
+        # shared/global across every concurrent _index_program_loop task
+        # (one per entry in INDEXED_PROGRAM_IDS) -- see config.py's
+        # indexing_rpc_failure_backoff_base_s docstring for why per-loop
+        # state doesn't actually throttle anything under concurrent load.
         self._indexing_rpc_consecutive_failures = 0
+        self._indexing_backoff_until = 0.0  # monotonic; _indexing_skip_reason() checks this
+        self._indexing_last_call_at = 0.0
+        self._indexing_call_timestamps: deque[float] = deque()  # sliding 60s window, for indexing_max_calls_per_minute
+        # mint -> (cached_at, liquidity_usd at that time, verdict). See
+        # _get_cached_verdict / evaluate_candidate.
+        self._verdict_cache: dict[str, tuple[float, float, SafetyVerdict]] = {}
+
+        # Event-driven discovery + second-wave entry state. See
+        # _check_pool_creation / _second_wave_loop / config.py's
+        # "event-driven discovery + second-wave entry" section.
+        self._pending_second_wave: dict[str, _PendingPool] = {}
+        self._pool_events_seen = 0          # every notification actually checked (post RPC-budget throttling)
+        self._pool_events_matched = 0       # of those, matched a creation/launch instruction with a resolved mint
+        self._second_wave_dispatched_count = 0
+        self._second_wave_expired_count = 0
+        self._second_wave_rejected_liquidity_count = 0
+        self._second_wave_rejected_retention_count = 0
+
         if config.helius_ws_url:
             self._ws = RpcWebSocket(config.helius_ws_url, logger=self.logger)
 
@@ -216,8 +260,49 @@ class Orchestrator:
     # the one path from candidate to position
     # ------------------------------------------------------------------
 
+    def _get_cached_verdict(self, candidate: Candidate) -> Optional[SafetyVerdict]:
+        """A cache hit means "skip the whole safety pipeline for this
+        rediscovery," not "reuse a stale verdict to act on" -- callers
+        return immediately on a hit rather than doing anything with the
+        verdict itself, since a cache hit exists purely to stop
+        re-evaluating the SAME mint every poll cycle. See
+        verdict_cache_ttl_s's docstring in config.py for why this exists:
+        DexScreener rediscovers the same actively-trending mints every
+        single cycle by design, so without this, evaluate_candidate's full
+        RPC/Jupiter/rugcheck/pump.fun pipeline reran on unchanged mints
+        forever.
+
+        Expired entries are evicted here rather than left to accumulate --
+        this cache has no separate cleanup pass.
+        """
+        cached = self._verdict_cache.get(candidate.mint)
+        if cached is None:
+            return None
+        cached_at, cached_liquidity, verdict = cached
+
+        if time.time() - cached_at >= self.config.verdict_cache_ttl_s:
+            del self._verdict_cache[candidate.mint]
+            return None
+
+        # A big liquidity swing is treated as a state-change event that
+        # invalidates the cache early, even inside the TTL -- cheap (data
+        # SignalEngine already gave us) and a reasonable proxy for "enough
+        # changed here that the old verdict might not hold," e.g. a rug
+        # pull draining the pool or a real pump attracting size.
+        if cached_liquidity > 0:
+            change = abs(candidate.liquidity_usd - cached_liquidity) / cached_liquidity
+            if change >= self.config.verdict_cache_liquidity_change_pct:
+                del self._verdict_cache[candidate.mint]
+                return None
+
+        return verdict
+
     def evaluate_candidate(self, candidate: Candidate) -> None:
         self.accounting.record_candidate(candidate)
+
+        if self._get_cached_verdict(candidate) is not None:
+            self.logger.debug("candidate skipped: cached verdict still fresh for %s", candidate.mint)
+            return
 
         # Observe-only (M2) skips the risk gate entirely: we want a safety
         # verdict logged for every candidate, not a subset filtered by
@@ -246,9 +331,22 @@ class Orchestrator:
         # _index_program_loop and KillSwitch's module docstring for the
         # incident that made this split necessary). See
         # _verdict_indicates_rpc_outage for exactly what counts.
-        newly_tripped = self.kill_switch.set_rpc_outage(self._verdict_indicates_rpc_outage(verdict))
+        rpc_outage_signal = self._verdict_indicates_rpc_outage(verdict)
+        newly_tripped = self.kill_switch.set_rpc_outage(rpc_outage_signal)
         if newly_tripped:
             self.alerter.notify_kill_switch(self.kill_switch.halt_reason())
+
+        if not rpc_outage_signal:
+            # An RPC-error verdict means "unknown," not a real pass/fail --
+            # caching it would suppress re-evaluating this mint for the
+            # full TTL exactly when a fresh attempt is most wanted (as soon
+            # as it's rediscovered, since the RPC may already have
+            # recovered by then). It also must never be allowed to mask a
+            # SUSTAINED outage: repeatedly rediscovering the same mint
+            # during a real outage should keep counting toward
+            # set_rpc_outage's threshold above, not get silently absorbed
+            # by the cache after the first attempt.
+            self._verdict_cache[candidate.mint] = (time.time(), candidate.liquidity_usd, verdict)
 
         if self.config.observe_only:
             # The entire point of M2: log the verdict, place no trade, live or paper.
@@ -348,6 +446,125 @@ class Orchestrator:
                     )
                 )
 
+    # ------------------------------------------------------------------
+    # event-driven discovery + second-wave entry
+    # ------------------------------------------------------------------
+
+    def _check_pool_creation(self, tx: dict, signature: str, program_id: str) -> None:
+        """Runs on the SAME transaction _parse_leader_activity just used --
+        InsiderRadar's indexing subscription already fetches every
+        notification's transaction via getTransaction, so detecting a
+        pool creation/token launch here costs zero additional RPC calls.
+        This is what makes event-driven discovery "free" on top of
+        indexing that was already running, rather than a second parallel
+        subscription duplicating the same traffic.
+
+        See pool_events.py's module docstring for exactly what confidence
+        level the detection itself is built on.
+        """
+        self._pool_events_seen += 1
+        event = detect_pool_creation(tx, signature, program_id)
+        if event is None:
+            return
+        self._pool_events_matched += 1
+
+        if event.mint in self._pending_second_wave or event.mint in self._verdict_cache:
+            return  # already tracking it, or already ran it through TokenSafety this cycle
+
+        if len(self._pending_second_wave) >= self.config.second_wave_max_pending:
+            oldest_mint = min(self._pending_second_wave, key=lambda m: self._pending_second_wave[m].created_at)
+            del self._pending_second_wave[oldest_mint]
+            self.logger.warning(
+                "second_wave_pending_evicted",
+                extra={"fields": {"mint": oldest_mint, "reason": "second_wave_max_pending exceeded"}},
+            )
+
+        created_at = event.block_time or time.time()
+        self._pending_second_wave[event.mint] = _PendingPool(mint=event.mint, program_id=program_id, created_at=created_at)
+        self.logger.info(
+            "pool_creation_detected",
+            extra={"fields": {"mint": event.mint, "program_id": program_id, "signature": signature}},
+        )
+
+    async def _second_wave_loop(self) -> None:
+        """Periodically samples every pending pool's live price (building
+        a high-water mark) and, once its age enters the second-wave
+        window, checks liquidity + price-retention ("first dump
+        absorbed") before dispatching it through the EXACT SAME
+        evaluate_candidate path every other discovery source uses -- no
+        shortcut around TokenSafety for a second-wave candidate.
+        """
+        loop = asyncio.get_running_loop()
+        while not self.stop_event.is_set():
+            await asyncio.sleep(self.config.second_wave_sample_interval_s)
+            now = time.time()
+            expired: list[str] = []
+            dispatched: list[str] = []
+
+            for mint, pending in list(self._pending_second_wave.items()):
+                age_s = now - pending.created_at
+                if age_s > self.config.second_wave_max_age_s:
+                    expired.append(mint)
+                    continue
+
+                candidate = await loop.run_in_executor(None, self.signal_engine.fetch_candidate_by_mint, mint)
+                if candidate is None or candidate.price_usd <= 0:
+                    continue  # not indexed by DexScreener yet (or zero liquidity) -- try again next sample
+
+                pending.last_price_usd = candidate.price_usd
+                pending.last_liquidity_usd = candidate.liquidity_usd
+                pending.high_price_usd = max(pending.high_price_usd, candidate.price_usd)
+                pending.samples += 1
+
+                if age_s < self.config.second_wave_min_age_s:
+                    continue  # too young -- keep sampling to build the high-water mark, don't evaluate yet
+
+                if candidate.liquidity_usd < self.config.min_pool_liquidity_usd:
+                    self._second_wave_rejected_liquidity_count += 1
+                    self.logger.debug(
+                        "second_wave_reject: %s liquidity $%.0f below floor $%.0f",
+                        mint, candidate.liquidity_usd, self.config.min_pool_liquidity_usd,
+                    )
+                    continue
+
+                retention = (pending.last_price_usd / pending.high_price_usd) if pending.high_price_usd > 0 else 0.0
+                if retention < self.config.second_wave_min_price_retention_pct:
+                    self._second_wave_rejected_retention_count += 1
+                    self.logger.debug(
+                        "second_wave_reject: %s price retention %.0f%% below floor %.0f%% (high $%.8f, now $%.8f)",
+                        mint, retention * 100, self.config.second_wave_min_price_retention_pct * 100,
+                        pending.high_price_usd, pending.last_price_usd,
+                    )
+                    continue
+
+                dispatched.append(mint)
+                self._second_wave_dispatched_count += 1
+                self.logger.info(
+                    "second_wave_dispatch",
+                    extra={
+                        "fields": {
+                            "mint": mint, "age_s": round(age_s, 1), "price_retention_pct": round(retention, 4),
+                            "high_price_usd": pending.high_price_usd, "liquidity_usd": candidate.liquidity_usd,
+                            "samples": pending.samples,
+                        }
+                    },
+                )
+                candidate.source = SignalSource.DEXSCREENER
+                await loop.run_in_executor(None, self._on_candidate, candidate)
+
+            for mint in dispatched:
+                del self._pending_second_wave[mint]
+            for mint in expired:
+                self._second_wave_expired_count += 1
+                self.logger.info("second_wave_expired", extra={"fields": {"mint": mint}})
+                del self._pending_second_wave[mint]
+
+    def _prune_indexing_call_window(self, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        cutoff = now - 60.0
+        while self._indexing_call_timestamps and self._indexing_call_timestamps[0] < cutoff:
+            self._indexing_call_timestamps.popleft()
+
     def _indexing_skip_reason(self) -> Optional[str]:
         """Indexing is the lowest-priority RPC consumer in this bot: it's
         background learning, not a trade that's waiting on a price. A
@@ -356,6 +573,13 @@ class Orchestrator:
         candidates), so it must never be what pushes RPC usage into the
         danger zone TokenSafety and ExitMonitor actually depend on.
 
+        This is the ONE gate both concurrent indexing loops (one per entry
+        in INDEXED_PROGRAM_IDS) check before every notification, which is
+        exactly what makes the backoff/rate-cap/calls-per-minute state
+        below actually global instead of each loop independently deciding
+        for itself -- see indexing_rpc_failure_backoff_base_s's docstring
+        in config.py for the incident that made per-loop state useless.
+
         Returns a reason string if the current notification should be
         dropped without ever making an RPC call, or None if it's fine to
         proceed. Kept as a small, pure, synchronous method so the backoff
@@ -363,6 +587,14 @@ class Orchestrator:
         """
         if self.kill_switch.is_halted():
             return f"kill switch halted ({self.kill_switch.halt_reason()})"
+        if self.rpc.is_method_disabled("getTransaction"):
+            return "getTransaction permanently disabled this run (see rpc_method_disabled log)"
+        remaining = self._indexing_backoff_until - time.monotonic()
+        if remaining > 0:
+            return f"backing off ({remaining:.1f}s remaining)"
+        self._prune_indexing_call_window()
+        if len(self._indexing_call_timestamps) >= self.config.indexing_max_calls_per_minute:
+            return f"indexing calls/min cap reached ({self.config.indexing_max_calls_per_minute}/min)"
         usage = self.rpc.budget.current_usage_pct()
         if usage >= self.config.indexing_max_rpc_budget_pct:
             return f"RPC budget usage {usage:.0%} >= indexing ceiling {self.config.indexing_max_rpc_budget_pct:.0%}"
@@ -382,30 +614,67 @@ class Orchestrator:
             signature = (notification.get("value") or {}).get("signature")
             if not signature:
                 continue
+
+            # Hard local rate cap on indexing's OWN getTransaction calls,
+            # shared across every concurrent loop -- independent of the RPC
+            # budget ceiling above, of how fast logsSubscribe notifications
+            # actually arrive, and of the exponential backoff below. A busy
+            # AMM program can fire several notifications a second; without
+            # this, that turns directly into several RPC calls a second
+            # from indexing as a whole, even before any failure has
+            # happened to trigger the backoff path.
+            now = time.monotonic()
+            elapsed = now - self._indexing_last_call_at
+            if elapsed < self.config.indexing_min_call_interval_s:
+                await asyncio.sleep(self.config.indexing_min_call_interval_s - elapsed)
+            self._indexing_last_call_at = time.monotonic()
+            self._indexing_call_timestamps.append(self._indexing_last_call_at)
+
             try:
                 tx = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self.rpc.call(
                         "getTransaction",
                         [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+                        # RpcGateway's own internal retry loop (default 3
+                        # attempts, with sleeps between) would otherwise run
+                        # on EVERY single call regardless of what indexing's
+                        # own backoff below is doing -- at up to ~1.5s of
+                        # wall time per failing call, that retry-inside-a-
+                        # retry was what actually produced the "still every
+                        # 1-3s, looks like fixed-interval retry" pattern,
+                        # not a lack of backoff. One attempt here means
+                        # indexing's own exponential backoff is the sole
+                        # authority over how long a failure costs.
+                        max_retries=1,
                     ),
                 )
                 self._indexing_rpc_consecutive_failures = 0
                 if tx:
                     self._parse_leader_activity(tx, signature)
+                    if self.config.enable_event_driven_discovery:
+                        # Same already-fetched transaction, no extra RPC
+                        # cost -- see _check_pool_creation's docstring for
+                        # why this rides on indexing's existing
+                        # subscription instead of a separate one.
+                        self._check_pool_creation(tx, signature, program_id)
+            except RpcMethodDisabled as exc:
+                # Permanently rejected (403, or a JSON-RPC error that reads
+                # like "not available on this plan") -- RpcGateway already
+                # logged rpc_method_disabled ONCE, the instant it detected
+                # this. Nothing left to do here: _indexing_skip_reason()
+                # above will drop every future notification before ever
+                # reaching this call again, so there's no ongoing failure
+                # to back off from or log repeatedly.
+                self.logger.debug("indexing notification dropped: %s", exc)
             except RpcOutage as exc:
                 # Indexing is best-effort background learning, not a trade
                 # waiting on a price -- its RPC failures must degrade
                 # gracefully and NEVER touch the kill switch (that's fed
                 # exclusively by TokenSafety's price-critical checks, see
-                # evaluate_candidate). A prior overnight run tripped the
-                # kill switch from exactly this loop within ~18s of startup
-                # -- a busy AMM program can fire many logsSubscribe
-                # notifications a second, each one a getTransaction call, so
-                # 3 consecutive failures happened here in seconds even
-                # though a plain curl to the same endpoint worked fine. The
-                # method + error are logged every time so a real outage is
-                # still fully diagnosable from the logs alone.
+                # evaluate_candidate). The method + error are logged every
+                # time so a real outage is still fully diagnosable from the
+                # logs alone.
                 self._indexing_rpc_consecutive_failures += 1
                 self.logger.warning(
                     "indexing_rpc_failure",
@@ -418,19 +687,28 @@ class Orchestrator:
                         }
                     },
                 )
-                if self._indexing_rpc_consecutive_failures >= self.config.indexing_max_consecutive_rpc_failures:
-                    self.logger.warning(
-                        "indexing_backing_off",
-                        extra={
-                            "fields": {
-                                "program_id": program_id,
-                                "cooldown_s": self.config.indexing_rpc_failure_cooldown_s,
-                                "consecutive_failures": self._indexing_rpc_consecutive_failures,
-                            }
-                        },
-                    )
-                    await asyncio.sleep(self.config.indexing_rpc_failure_cooldown_s)
-                    self._indexing_rpc_consecutive_failures = 0  # self-heals: try again after the cooldown
+                # Exponential from the very first failure, not after a
+                # grace threshold -- and written to the SHARED
+                # _indexing_backoff_until timestamp rather than an
+                # await-sleep in just this task, so it's respected by every
+                # concurrent indexing loop via _indexing_skip_reason() above,
+                # not just the one that happened to hit the failure.
+                backoff = min(
+                    self.config.indexing_rpc_failure_backoff_base_s
+                    * (2 ** (self._indexing_rpc_consecutive_failures - 1)),
+                    self.config.indexing_rpc_failure_backoff_max_s,
+                )
+                self._indexing_backoff_until = time.monotonic() + backoff
+                self.logger.warning(
+                    "indexing_backing_off",
+                    extra={
+                        "fields": {
+                            "program_id": program_id,
+                            "backoff_s": backoff,
+                            "consecutive_failures": self._indexing_rpc_consecutive_failures,
+                        }
+                    },
+                )
 
     # ------------------------------------------------------------------
     # daily/weekly reporting
@@ -487,6 +765,16 @@ class Orchestrator:
                         "ws_total_reconnects": ws_stats["total_reconnects"],
                         "kill_switch_halted": self.kill_switch.is_halted(),
                         "open_positions": len(self.open_positions),
+                        "indexing_skipped": self._indexing_skipped_count,
+                        "indexing_backing_off": self._indexing_backoff_until > time.monotonic(),
+                        "rpc_disabled_methods": rpc_stats["disabled_methods"],
+                        "ws_pool_events_seen": self._pool_events_seen,
+                        "ws_pool_events_matched": self._pool_events_matched,
+                        "second_wave_pending": len(self._pending_second_wave),
+                        "second_wave_dispatched_total": self._second_wave_dispatched_count,
+                        "second_wave_expired_total": self._second_wave_expired_count,
+                        "second_wave_rejected_liquidity_total": self._second_wave_rejected_liquidity_count,
+                        "second_wave_rejected_retention_total": self._second_wave_rejected_retention_count,
                     }
                 },
             )
@@ -558,6 +846,8 @@ class Orchestrator:
         if self._ws is not None:
             for program_id in INDEXED_PROGRAM_IDS:
                 tasks.append(asyncio.create_task(self._index_program_loop(program_id)))
+            if self.config.enable_event_driven_discovery:
+                tasks.append(asyncio.create_task(self._second_wave_loop()))
 
         await self.stop_event.wait()
         for t in tasks:
