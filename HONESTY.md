@@ -66,6 +66,20 @@ don't read them as irrelevant either, since a bot that can't survive its
 own cold start on trend-following alone has no business advancing to
 insider-copy trades in the first place.
 
+## InsiderRadar's indexing has real, unrecoverable coverage gaps
+
+`RpcWebSocket.subscribe()` reconnects on a dropped WebSocket and correctly
+re-sends the subscribe request -- it does not silently die or get stuck.
+What it cannot do is recover the gap itself: `logsSubscribe` is a live
+stream with no replay or cursor on Solana's side, so any transaction the
+chain confirmed between the drop and the new connection's ack is gone,
+not delayed. `total_reconnects` and `last_drop_at` (surfaced in the
+heartbeat log) tell you how often this happened, not what was missed
+during it. In practice this means InsiderRadar's first-buyer/conviction
+data is a *sample* of on-chain activity, not a complete record, even on a
+long-running, well-connected instance -- treat wallet stats as directionally
+useful, not as an exact trade count.
+
 ## What would genuinely surprise us
 
 A result that would be a genuine, non-obvious surprise: the conviction

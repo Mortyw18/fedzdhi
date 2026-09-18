@@ -9,6 +9,8 @@ altogether rather than hammering a dead endpoint forever.
 """
 from __future__ import annotations
 
+import time
+
 import requests
 
 from bot.models import SignalSource
@@ -172,6 +174,150 @@ def test_poll_counters_increment_for_the_heartbeat_log():
     engine.poll_dexscreener_once()
     engine.poll_dexscreener_once()
     assert engine.dexscreener_polls_done == 3
+
+
+def _pair(mint: str, symbol: str, liquidity=50_000, vol5m=20_000, buys=10, sells=2, age_s=300):
+    return {
+        "chainId": "solana",
+        "pairAddress": f"pair-{mint}",
+        "dexId": "raydium",
+        "baseToken": {"address": mint, "symbol": symbol},
+        "liquidity": {"usd": liquidity},
+        "volume": {"m5": vol5m, "h1": vol5m * 4},
+        "txns": {"m5": {"buys": buys, "sells": sells}},
+        "priceUsd": "0.001",
+        "pairCreatedAt": (time.time() - age_s) * 1000.0,
+    }
+
+
+class _MultiSourceSession:
+    """Routes by URL shape to the right fake payload for each of the three
+    DexScreener discovery sources (token-profiles, token-boosts, search),
+    plus the tokens/{addresses} resolve endpoint -- lets tests target one
+    source at a time without a real HTTP mock library."""
+
+    def __init__(self, profiles=None, boosts=None, tokens_by_addr=None, search_by_query=None, raise_on=None):
+        self.profiles = profiles if profiles is not None else []
+        self.boosts = boosts if boosts is not None else []
+        self.tokens_by_addr = tokens_by_addr or {}
+        self.search_by_query = search_by_query or {}
+        self.raise_on = raise_on or set()
+        self.calls: list[tuple] = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, params))
+        if "token-profiles" in url:
+            if "profiles" in self.raise_on:
+                raise requests.ConnectionError("profiles endpoint down")
+            return _FakeResponse(200, payload=self.profiles)
+        if "token-boosts" in url:
+            if "boosts" in self.raise_on:
+                raise requests.ConnectionError("boosts endpoint down")
+            return _FakeResponse(200, payload=self.boosts)
+        if "/latest/dex/tokens/" in url:
+            if "resolve" in self.raise_on:
+                raise requests.ConnectionError("resolve endpoint down")
+            addrs = url.rsplit("/", 1)[-1]
+            return _FakeResponse(200, payload={"pairs": self.tokens_by_addr.get(addrs, [])})
+        if "/latest/dex/search" in url:
+            query = params.get("q") if params else None
+            if f"search:{query}" in self.raise_on:
+                raise requests.ConnectionError(f"search endpoint down for {query}")
+            return _FakeResponse(200, payload={"pairs": self.search_by_query.get(query, [])})
+        raise AssertionError(f"unexpected DexScreener URL in test: {url}")
+
+
+def test_token_profiles_and_boosts_are_the_primary_discovery_path():
+    """The scenario /search alone could never satisfy: a pool ~5 minutes
+    old, well within the freshness window, discovered via token-profiles
+    instead of a text search that essentially never ranks a pool this
+    young (see poll_dexscreener_once's docstring for the overnight run that
+    proved this)."""
+    mint = "FreshMint111"
+    session = _MultiSourceSession(
+        profiles=[{"chainId": "solana", "tokenAddress": mint}],
+        tokens_by_addr={mint: [_pair(mint, "FRESH", age_s=300)]},
+    )
+    engine = _engine(session)
+    candidates = engine.poll_dexscreener_once()
+    assert [c.mint for c in candidates] == [mint]
+
+
+def test_token_boosts_also_feed_discovery():
+    mint = "BoostedMint222"
+    session = _MultiSourceSession(
+        boosts=[{"chainId": "solana", "tokenAddress": mint}],
+        tokens_by_addr={mint: [_pair(mint, "BOOST", age_s=120)]},
+    )
+    engine = _engine(session)
+    candidates = engine.poll_dexscreener_once()
+    assert [c.mint for c in candidates] == [mint]
+
+
+def test_non_solana_profiles_and_boosts_are_never_resolved():
+    session = _MultiSourceSession(
+        profiles=[{"chainId": "base", "tokenAddress": "0xNotSolana"}],
+        boosts=[{"chainId": "ethereum", "tokenAddress": "0xAlsoNotSolana"}],
+    )
+    engine = _engine(session)
+    candidates = engine.poll_dexscreener_once()
+    assert candidates == []
+    # Never even attempted to resolve an off-chain address via tokens/{addr}.
+    assert not any("/latest/dex/tokens/" in url for url, _ in session.calls)
+
+
+def test_search_queries_are_multiple_by_default_not_one_hardcoded_term():
+    engine = _engine(_MultiSourceSession())
+    assert len(engine.dexscreener_search_queries) > 1
+
+
+def test_every_configured_search_query_is_actually_requested():
+    session = _MultiSourceSession()
+    engine = SignalEngine(
+        min_pool_liquidity_usd=15_000, max_pool_liquidity_usd=400_000, max_pool_age_s=72 * 3600,
+        min_volume_liquidity_ratio=0.20, min_buy_sell_ratio=1.5,
+        dexscreener_search_queries=["alpha", "beta", "gamma"],
+        session=session,
+    )
+    engine.poll_dexscreener_once()
+    searched = {params.get("q") for url, params in session.calls if "/latest/dex/search" in url}
+    assert searched == {"alpha", "beta", "gamma"}
+
+
+def test_one_dead_dexscreener_source_does_not_block_the_others():
+    mint = "BoostedMint333"
+    session = _MultiSourceSession(
+        boosts=[{"chainId": "solana", "tokenAddress": mint}],
+        tokens_by_addr={mint: [_pair(mint, "SURVIVOR", age_s=90)]},
+        raise_on={"profiles"},
+    )
+    engine = _engine(session)
+    candidates = engine.poll_dexscreener_once()  # must not raise despite profiles being down
+    assert [c.mint for c in candidates] == [mint]
+
+
+def test_all_dexscreener_sources_down_returns_empty_not_an_exception():
+    session = _MultiSourceSession(raise_on={"profiles", "boosts", "search:SOL", "search:pump", "search:bonk", "search:meme"})
+    engine = _engine(session)
+    assert engine.poll_dexscreener_once() == []
+
+
+def test_dedupes_the_same_pool_seen_via_both_boosts_and_search():
+    mint = "DupeMint444"
+    pair = _pair(mint, "DUPE", age_s=200)
+    session = _MultiSourceSession(
+        boosts=[{"chainId": "solana", "tokenAddress": mint}],
+        tokens_by_addr={mint: [pair]},
+        search_by_query={"SOL": [pair]},
+    )
+    engine = SignalEngine(
+        min_pool_liquidity_usd=15_000, max_pool_liquidity_usd=400_000, max_pool_age_s=72 * 3600,
+        min_volume_liquidity_ratio=0.20, min_buy_sell_ratio=1.5,
+        dexscreener_search_queries=["SOL"],
+        session=session,
+    )
+    candidates = engine.poll_dexscreener_once()
+    assert len(candidates) == 1
 
 
 def test_pumpfun_poll_counter_frozen_once_disabled():

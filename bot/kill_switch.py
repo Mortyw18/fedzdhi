@@ -13,6 +13,16 @@ Trips on any of three conditions:
     on any RPC success to reset the streak; only a real, sustained failure
     should ever halt anything.
 
+    set_rpc_outage is fed ONLY by Orchestrator.evaluate_candidate, from
+    TokenSafety's verdict -- the price-critical path an actual buy is gated
+    on. A second overnight run tripped this from InsiderRadar's background
+    on-chain indexing instead (a busy AMM program can fire many logsSubscribe
+    notifications a second, each one a getTransaction call, so 3 consecutive
+    failures there can happen in seconds even against a healthy endpoint).
+    Indexing is best-effort learning, not a trade waiting on a price, so its
+    RPC failures now degrade locally (log + a short self-throttle, see
+    Orchestrator._index_program_loop) and never call this method at all.
+
 State is persisted to disk so a halt survives a restart -- this is
 deliberate, not an oversight: a halt exists specifically so a crash-loop
 or repeated restart can't silently keep trading through a real problem.
@@ -182,6 +192,10 @@ class KillSwitch:
     def daily_pnl_sol(self) -> float:
         self._roll_day_if_needed()
         return self.state.daily_pnl_sol
+
+    @property
+    def consecutive_rpc_outages(self) -> int:
+        return self.state.consecutive_rpc_outages
 
     def reset(self) -> None:
         """Manual reset. Clears the halt and failure streaks; daily PnL history

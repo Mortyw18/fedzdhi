@@ -298,6 +298,18 @@ class RpcWebSocket:
     Reconnects with backoff on drop. Each subscribed stream is consumed as
     an async generator of decoded notification payloads -- callers (mostly
     InsiderRadar and SignalEngine's pump.fun feed) just iterate it.
+
+    On a drop, subscribe() re-establishes the connection and re-sends the
+    exact same subscribe request -- it does NOT silently give up or fail to
+    resubscribe (see test_rpc_websocket.py's
+    test_reconnect_resumes_yielding_notifications_after_drop). What it
+    cannot do is recover: logsSubscribe/accountSubscribe are live streams
+    with no replay/cursor mechanism on Solana's side, so any notification
+    the chain emitted during the gap between the drop and the new
+    connection's ack is gone for good, not just delayed. That gap is a real,
+    inherent coverage hole in InsiderRadar's indexing (not a bug fixable
+    here) -- total_reconnects/last_drop_at in get_ws_stats() and the
+    heartbeat log are what make it visible rather than silent.
     """
 
     def __init__(self, ws_url: str, logger: Optional[logging.Logger] = None) -> None:

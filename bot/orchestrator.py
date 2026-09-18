@@ -113,6 +113,7 @@ class Orchestrator:
             min_volume_liquidity_ratio=config.min_volume_liquidity_ratio,
             min_buy_sell_ratio=config.min_buy_sell_ratio,
             dexscreener_poll_interval_s=config.dexscreener_poll_interval_s,
+            dexscreener_search_queries=config.dexscreener_search_queries,
             pumpfun_max_consecutive_failures=config.pumpfun_max_consecutive_failures,
             enable_pumpfun_source=config.enable_pumpfun_source,
             logger=self.logger,
@@ -170,6 +171,10 @@ class Orchestrator:
         self._token_decimals_cache: dict[str, int] = {}
         self._ws: Optional[RpcWebSocket] = None
         self._indexing_skipped_count = 0
+        # Local, kill-switch-independent degrade for indexing's own RPC
+        # failures -- see _index_program_loop and KillSwitch's module
+        # docstring for why this must never call kill_switch.set_rpc_outage.
+        self._indexing_rpc_consecutive_failures = 0
         if config.helius_ws_url:
             self._ws = RpcWebSocket(config.helius_ws_url, logger=self.logger)
 
@@ -190,6 +195,22 @@ class Orchestrator:
 
     def _open_positions_list(self) -> list[Position]:
         return list(self.open_positions.values())
+
+    @staticmethod
+    def _verdict_indicates_rpc_outage(verdict) -> bool:
+        """True when at least one of TokenSafety's RPC-backed checks
+        (mint_freeze_authority, lp_burned_or_graduated, holder_concentration,
+        transfer_fee_tax) failed with TokenSafety's own "rpc error: " detail
+        prefix -- i.e. an RPC call inside this evaluate() actually failed,
+        not just a candidate that failed on its own merits (no LP mint
+        known, too concentrated, price impact too high, ...). Deliberately
+        an OR, not "every failing check": check_lp_or_graduation fails with
+        a non-RPC reason ("no LP mint known") for almost every DexScreener
+        candidate regardless of RPC health, since parse_dexscreener_pair
+        never populates lp_mint -- requiring ALL failures to be RPC-flavored
+        would make this signal never fire in practice. This is the single
+        signal that feeds KillSwitch.set_rpc_outage; see evaluate_candidate."""
+        return any(not c.passed and c.detail.startswith("rpc error:") for c in verdict.checks)
 
     # ------------------------------------------------------------------
     # the one path from candidate to position
@@ -218,6 +239,16 @@ class Orchestrator:
             distinct_token_lookup=self.insider_radar.distinct_token_count,
         )
         self.accounting.record_safety_verdict(verdict)
+
+        # TokenSafety is the ONLY RPC-outage signal that feeds the kill
+        # switch: it's the price-critical path a buy is actually gated on,
+        # unlike InsiderRadar's best-effort background indexing (see
+        # _index_program_loop and KillSwitch's module docstring for the
+        # incident that made this split necessary). See
+        # _verdict_indicates_rpc_outage for exactly what counts.
+        newly_tripped = self.kill_switch.set_rpc_outage(self._verdict_indicates_rpc_outage(verdict))
+        if newly_tripped:
+            self.alerter.notify_kill_switch(self.kill_switch.halt_reason())
 
         if self.config.observe_only:
             # The entire point of M2: log the verdict, place no trade, live or paper.
@@ -359,13 +390,47 @@ class Orchestrator:
                         [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
                     ),
                 )
-                self.kill_switch.set_rpc_outage(False)  # a successful round-trip resets the sustained-failure streak
+                self._indexing_rpc_consecutive_failures = 0
                 if tx:
                     self._parse_leader_activity(tx, signature)
-            except RpcOutage:
-                newly_tripped = self.kill_switch.set_rpc_outage(True)
-                if newly_tripped:
-                    self.alerter.notify_kill_switch(self.kill_switch.halt_reason())
+            except RpcOutage as exc:
+                # Indexing is best-effort background learning, not a trade
+                # waiting on a price -- its RPC failures must degrade
+                # gracefully and NEVER touch the kill switch (that's fed
+                # exclusively by TokenSafety's price-critical checks, see
+                # evaluate_candidate). A prior overnight run tripped the
+                # kill switch from exactly this loop within ~18s of startup
+                # -- a busy AMM program can fire many logsSubscribe
+                # notifications a second, each one a getTransaction call, so
+                # 3 consecutive failures happened here in seconds even
+                # though a plain curl to the same endpoint worked fine. The
+                # method + error are logged every time so a real outage is
+                # still fully diagnosable from the logs alone.
+                self._indexing_rpc_consecutive_failures += 1
+                self.logger.warning(
+                    "indexing_rpc_failure",
+                    extra={
+                        "fields": {
+                            "method": "getTransaction",
+                            "program_id": program_id,
+                            "consecutive": self._indexing_rpc_consecutive_failures,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                if self._indexing_rpc_consecutive_failures >= self.config.indexing_max_consecutive_rpc_failures:
+                    self.logger.warning(
+                        "indexing_backing_off",
+                        extra={
+                            "fields": {
+                                "program_id": program_id,
+                                "cooldown_s": self.config.indexing_rpc_failure_cooldown_s,
+                                "consecutive_failures": self._indexing_rpc_consecutive_failures,
+                            }
+                        },
+                    )
+                    await asyncio.sleep(self.config.indexing_rpc_failure_cooldown_s)
+                    self._indexing_rpc_consecutive_failures = 0  # self-heals: try again after the cooldown
 
     # ------------------------------------------------------------------
     # daily/weekly reporting
