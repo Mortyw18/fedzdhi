@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 import requests
 
-from bot.rpc_gateway import RateBudget, RpcGateway, RpcOutage
+from bot.rpc_gateway import RateBudget, RpcGateway, RpcMethodDisabled, RpcOutage
 
 
 def _ok_body(result="pong"):
@@ -42,8 +42,12 @@ class _ScriptedSession:
         kind, *rest = self.script.pop(0)
         if kind == "429":
             return _FakeResp(429)
+        if kind == "403":
+            return _FakeResp(403)
         if kind == "ok":
             return _FakeResp(200, rest[0] if rest else _ok_body())
+        if kind == "jsonrpc_error":
+            return _FakeResp(200, {"jsonrpc": "2.0", "id": 1, "error": rest[0]})
         if kind == "error":
             raise requests.ConnectionError("simulated network error")
         raise AssertionError(f"unknown script kind {kind}")
@@ -231,3 +235,106 @@ def test_rate_budget_rearms_only_after_dropping_to_clear_threshold():
     for _ in range(8):
         budget.record_and_check()
     assert len(alerts) == 2
+
+
+# ----------------------------------------------------------------------
+# permanent method rejection (403 / "method not available") detection
+# ----------------------------------------------------------------------
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_403_disables_the_method_immediately_no_further_retries(mock_sleep):
+    session = _ScriptedSession([("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+
+    assert session.calls == 1  # not max_retries=5 -- a 403 is never worth retrying
+    assert gw.is_method_disabled("getProgramAccounts") is True
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_disabled_method_fails_instantly_on_next_call_no_network(mock_sleep):
+    session = _ScriptedSession([("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+    assert session.calls == 1
+
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+    assert session.calls == 1  # still 1 -- the second call never touched the network
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_jsonrpc_method_not_found_code_disables_the_method(mock_sleep):
+    session = _ScriptedSession([("jsonrpc_error", {"code": -32601, "message": "Method not found"})])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getSomeEnhancedMethod")
+    assert gw.is_method_disabled("getSomeEnhancedMethod") is True
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_jsonrpc_plan_gated_message_disables_the_method(mock_sleep):
+    session = _ScriptedSession([("jsonrpc_error", {"code": -32000, "message": "This method is not available on your current plan"})])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getSomeEnhancedMethod")
+    assert gw.is_method_disabled("getSomeEnhancedMethod") is True
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_ordinary_jsonrpc_error_does_not_disable_the_method(mock_sleep):
+    """An error that doesn't look like "unavailable" -- e.g. a bad
+    parameter -- must not be mistaken for a permanent rejection and
+    silently disable a method that actually works."""
+    session = _ScriptedSession([
+        ("jsonrpc_error", {"code": -32602, "message": "Invalid params"}),
+        ("jsonrpc_error", {"code": -32602, "message": "Invalid params"}),
+    ])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=2)
+
+    with pytest.raises(RpcOutage):
+        gw.call("getAccountInfo")
+    assert gw.is_method_disabled("getAccountInfo") is False
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_disabled_methods_listed_in_call_stats(mock_sleep):
+    session = _ScriptedSession([("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+    assert gw.get_call_stats()["disabled_methods"] == ["getProgramAccounts"]
+
+
+# ----------------------------------------------------------------------
+# per-call max_retries override
+# ----------------------------------------------------------------------
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_max_retries_override_limits_attempts_for_one_call(mock_sleep):
+    """Orchestrator's indexing loop passes max_retries=1: it runs its own
+    separate backoff across repeated calls and doesn't want this internal
+    retry loop also sleeping/retrying on every single call, which would
+    mask the outer backoff entirely."""
+    session = _ScriptedSession([("error",), ("error",), ("error",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)  # instance default is 5
+
+    with pytest.raises(RpcOutage):
+        gw.call("getTransaction", max_retries=1)
+
+    assert session.calls == 1  # NOT 5 -- the override wins for this call
+
+
+def test_max_retries_override_none_falls_back_to_instance_default():
+    session = _ScriptedSession([("ok", _ok_body())])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    gw.call("getBalance")  # no override passed
+    assert session.calls == 1

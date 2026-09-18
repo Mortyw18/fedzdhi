@@ -13,6 +13,7 @@ import asyncio
 import logging
 import signal
 import time
+from collections import deque
 from typing import Optional
 
 from nacl.signing import SigningKey
@@ -36,7 +37,7 @@ from bot.models import (
     WalletSellRecord,
 )
 from bot.risk_manager import RiskManager
-from bot.rpc_gateway import RpcGateway, RpcOutage, RpcWebSocket
+from bot.rpc_gateway import RpcGateway, RpcMethodDisabled, RpcOutage, RpcWebSocket
 from bot.signal_engine import SignalEngine
 from bot.solana_wallet import Wallet, load_wallet_from_env
 from bot.token_safety import TokenSafety
@@ -174,12 +175,17 @@ class Orchestrator:
         self._token_decimals_cache: dict[str, int] = {}
         self._ws: Optional[RpcWebSocket] = None
         self._indexing_skipped_count = 0
-        # Local, kill-switch-independent degrade for indexing's own RPC
-        # failures -- see _index_program_loop and KillSwitch's module
-        # docstring for why this must never call kill_switch.set_rpc_outage.
+        # Kill-switch-independent degrade for indexing's own RPC failures --
+        # see _index_program_loop and KillSwitch's module docstring for why
+        # this must never call kill_switch.set_rpc_outage. ALL of this is
+        # shared/global across every concurrent _index_program_loop task
+        # (one per entry in INDEXED_PROGRAM_IDS) -- see config.py's
+        # indexing_rpc_failure_backoff_base_s docstring for why per-loop
+        # state doesn't actually throttle anything under concurrent load.
         self._indexing_rpc_consecutive_failures = 0
-        self._indexing_rpc_backoff_level = 0
+        self._indexing_backoff_until = 0.0  # monotonic; _indexing_skip_reason() checks this
         self._indexing_last_call_at = 0.0
+        self._indexing_call_timestamps: deque[float] = deque()  # sliding 60s window, for indexing_max_calls_per_minute
         # mint -> (cached_at, liquidity_usd at that time, verdict). See
         # _get_cached_verdict / evaluate_candidate.
         self._verdict_cache: dict[str, tuple[float, float, SafetyVerdict]] = {}
@@ -410,6 +416,12 @@ class Orchestrator:
                     )
                 )
 
+    def _prune_indexing_call_window(self, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        cutoff = now - 60.0
+        while self._indexing_call_timestamps and self._indexing_call_timestamps[0] < cutoff:
+            self._indexing_call_timestamps.popleft()
+
     def _indexing_skip_reason(self) -> Optional[str]:
         """Indexing is the lowest-priority RPC consumer in this bot: it's
         background learning, not a trade that's waiting on a price. A
@@ -418,6 +430,13 @@ class Orchestrator:
         candidates), so it must never be what pushes RPC usage into the
         danger zone TokenSafety and ExitMonitor actually depend on.
 
+        This is the ONE gate both concurrent indexing loops (one per entry
+        in INDEXED_PROGRAM_IDS) check before every notification, which is
+        exactly what makes the backoff/rate-cap/calls-per-minute state
+        below actually global instead of each loop independently deciding
+        for itself -- see indexing_rpc_failure_backoff_base_s's docstring
+        in config.py for the incident that made per-loop state useless.
+
         Returns a reason string if the current notification should be
         dropped without ever making an RPC call, or None if it's fine to
         proceed. Kept as a small, pure, synchronous method so the backoff
@@ -425,6 +444,14 @@ class Orchestrator:
         """
         if self.kill_switch.is_halted():
             return f"kill switch halted ({self.kill_switch.halt_reason()})"
+        if self.rpc.is_method_disabled("getTransaction"):
+            return "getTransaction permanently disabled this run (see rpc_method_disabled log)"
+        remaining = self._indexing_backoff_until - time.monotonic()
+        if remaining > 0:
+            return f"backing off ({remaining:.1f}s remaining)"
+        self._prune_indexing_call_window()
+        if len(self._indexing_call_timestamps) >= self.config.indexing_max_calls_per_minute:
+            return f"indexing calls/min cap reached ({self.config.indexing_max_calls_per_minute}/min)"
         usage = self.rpc.budget.current_usage_pct()
         if usage >= self.config.indexing_max_rpc_budget_pct:
             return f"RPC budget usage {usage:.0%} >= indexing ceiling {self.config.indexing_max_rpc_budget_pct:.0%}"
@@ -445,17 +472,20 @@ class Orchestrator:
             if not signature:
                 continue
 
-            # Hard local rate cap on THIS loop's own getTransaction calls --
-            # independent of the RPC budget ceiling above, of how fast
-            # logsSubscribe notifications actually arrive, and of the
-            # exponential backoff below. A busy AMM program can fire several
-            # notifications a second; without this, that turns directly into
-            # several RPC calls a second from here alone, even before any
-            # failure has happened to trigger the backoff path.
-            elapsed = time.monotonic() - self._indexing_last_call_at
+            # Hard local rate cap on indexing's OWN getTransaction calls,
+            # shared across every concurrent loop -- independent of the RPC
+            # budget ceiling above, of how fast logsSubscribe notifications
+            # actually arrive, and of the exponential backoff below. A busy
+            # AMM program can fire several notifications a second; without
+            # this, that turns directly into several RPC calls a second
+            # from indexing as a whole, even before any failure has
+            # happened to trigger the backoff path.
+            now = time.monotonic()
+            elapsed = now - self._indexing_last_call_at
             if elapsed < self.config.indexing_min_call_interval_s:
                 await asyncio.sleep(self.config.indexing_min_call_interval_s - elapsed)
             self._indexing_last_call_at = time.monotonic()
+            self._indexing_call_timestamps.append(self._indexing_last_call_at)
 
             try:
                 tx = await asyncio.get_running_loop().run_in_executor(
@@ -463,25 +493,39 @@ class Orchestrator:
                     lambda: self.rpc.call(
                         "getTransaction",
                         [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+                        # RpcGateway's own internal retry loop (default 3
+                        # attempts, with sleeps between) would otherwise run
+                        # on EVERY single call regardless of what indexing's
+                        # own backoff below is doing -- at up to ~1.5s of
+                        # wall time per failing call, that retry-inside-a-
+                        # retry was what actually produced the "still every
+                        # 1-3s, looks like fixed-interval retry" pattern,
+                        # not a lack of backoff. One attempt here means
+                        # indexing's own exponential backoff is the sole
+                        # authority over how long a failure costs.
+                        max_retries=1,
                     ),
                 )
                 self._indexing_rpc_consecutive_failures = 0
-                self._indexing_rpc_backoff_level = 0
                 if tx:
                     self._parse_leader_activity(tx, signature)
+            except RpcMethodDisabled as exc:
+                # Permanently rejected (403, or a JSON-RPC error that reads
+                # like "not available on this plan") -- RpcGateway already
+                # logged rpc_method_disabled ONCE, the instant it detected
+                # this. Nothing left to do here: _indexing_skip_reason()
+                # above will drop every future notification before ever
+                # reaching this call again, so there's no ongoing failure
+                # to back off from or log repeatedly.
+                self.logger.debug("indexing notification dropped: %s", exc)
             except RpcOutage as exc:
                 # Indexing is best-effort background learning, not a trade
                 # waiting on a price -- its RPC failures must degrade
                 # gracefully and NEVER touch the kill switch (that's fed
                 # exclusively by TokenSafety's price-critical checks, see
-                # evaluate_candidate). A prior overnight run tripped the
-                # kill switch from exactly this loop within ~18s of startup
-                # -- a busy AMM program can fire many logsSubscribe
-                # notifications a second, each one a getTransaction call, so
-                # a handful of consecutive failures happened here in seconds
-                # even though a plain curl to the same endpoint worked fine.
-                # The method + error are logged every time so a real outage
-                # is still fully diagnosable from the logs alone.
+                # evaluate_candidate). The method + error are logged every
+                # time so a real outage is still fully diagnosable from the
+                # logs alone.
                 self._indexing_rpc_consecutive_failures += 1
                 self.logger.warning(
                     "indexing_rpc_failure",
@@ -494,32 +538,28 @@ class Orchestrator:
                         }
                     },
                 )
-                if self._indexing_rpc_consecutive_failures >= self.config.indexing_max_consecutive_rpc_failures:
-                    # Exponential, not flat: a flat cooldown meant a
-                    # genuinely sustained outage got retried on a fixed
-                    # schedule forever (fail fast, pause N seconds, fail
-                    # fast again the instant the pause ends, repeat) instead
-                    # of backing off further the longer it persists. Resets
-                    # to level 0 on the next success above.
-                    self._indexing_rpc_backoff_level += 1
-                    backoff = min(
-                        self.config.indexing_rpc_failure_backoff_base_s
-                        * (2 ** (self._indexing_rpc_backoff_level - 1)),
-                        self.config.indexing_rpc_failure_backoff_max_s,
-                    )
-                    self.logger.warning(
-                        "indexing_backing_off",
-                        extra={
-                            "fields": {
-                                "program_id": program_id,
-                                "backoff_s": backoff,
-                                "backoff_level": self._indexing_rpc_backoff_level,
-                                "consecutive_failures": self._indexing_rpc_consecutive_failures,
-                            }
-                        },
-                    )
-                    await asyncio.sleep(backoff)
-                    self._indexing_rpc_consecutive_failures = 0  # self-heals: try again after the backoff
+                # Exponential from the very first failure, not after a
+                # grace threshold -- and written to the SHARED
+                # _indexing_backoff_until timestamp rather than an
+                # await-sleep in just this task, so it's respected by every
+                # concurrent indexing loop via _indexing_skip_reason() above,
+                # not just the one that happened to hit the failure.
+                backoff = min(
+                    self.config.indexing_rpc_failure_backoff_base_s
+                    * (2 ** (self._indexing_rpc_consecutive_failures - 1)),
+                    self.config.indexing_rpc_failure_backoff_max_s,
+                )
+                self._indexing_backoff_until = time.monotonic() + backoff
+                self.logger.warning(
+                    "indexing_backing_off",
+                    extra={
+                        "fields": {
+                            "program_id": program_id,
+                            "backoff_s": backoff,
+                            "consecutive_failures": self._indexing_rpc_consecutive_failures,
+                        }
+                    },
+                )
 
     # ------------------------------------------------------------------
     # daily/weekly reporting
@@ -576,6 +616,9 @@ class Orchestrator:
                         "ws_total_reconnects": ws_stats["total_reconnects"],
                         "kill_switch_halted": self.kill_switch.is_halted(),
                         "open_positions": len(self.open_positions),
+                        "indexing_skipped": self._indexing_skipped_count,
+                        "indexing_backing_off": self._indexing_backoff_until > time.monotonic(),
+                        "rpc_disabled_methods": rpc_stats["disabled_methods"],
                     }
                 },
             )

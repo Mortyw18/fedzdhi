@@ -157,18 +157,23 @@ class Config:
     # Indexing's own RPC failures (getTransaction on a logsSubscribe
     # notification) must degrade gracefully and never touch the kill switch
     # -- that's reserved for TokenSafety's price-critical checks (see
-    # KillSwitch's module docstring). After this many consecutive
-    # getTransaction failures the indexer pauses itself, growing the pause
-    # exponentially (base * 2^level, capped) each time it crosses the
-    # threshold again without an intervening success -- a flat cooldown
-    # wasn't enough under real load: a busy AMM program firing notifications
-    # several times a second can burn through `indexing_max_consecutive_rpc_failures`
-    # in under a second, take one fixed-length pause, and immediately start
-    # failing again the instant it's over, forever, if the outage is
-    # actually sustained.
-    indexing_max_consecutive_rpc_failures: int = 5
-    indexing_rpc_failure_backoff_base_s: float = 5.0
-    indexing_rpc_failure_backoff_max_s: float = 300.0
+    # KillSwitch's module docstring). Every throttle below is GLOBAL/SHARED
+    # across every concurrent indexing loop (Orchestrator runs one per
+    # indexed program ID, see INDEXED_PROGRAM_IDS) -- per-loop state was
+    # tried first and doesn't work: one program's loop backing off did
+    # nothing to stop the OTHER program's loop from continuing to fail on
+    # its own independent schedule at the same time, which from the logs
+    # looked exactly like "no backoff at all, fixed-interval retries."
+    #
+    # Backoff grows exponentially on every consecutive getTransaction
+    # failure (base * 2^(consecutive-1), capped), starting on the very
+    # first failure -- not after a grace threshold. A flat or
+    # threshold-gated cooldown wasn't enough under real load: a busy AMM
+    # program firing notifications several times a second needs the pause
+    # to start immediately and keep growing for as long as the outage
+    # actually persists.
+    indexing_rpc_failure_backoff_base_s: float = 2.0
+    indexing_rpc_failure_backoff_max_s: float = 60.0
     # A hard, local floor on the spacing between the indexer's OWN
     # getTransaction attempts -- independent of how fast logsSubscribe
     # notifications actually arrive, how the RPC budget ceiling above is
@@ -177,6 +182,15 @@ class Config:
     # from this loop, full stop, even on the very first burst before any of
     # the other throttles have had a chance to kick in.
     indexing_min_call_interval_s: float = 0.5
+    # A second, independent ceiling: no more than this many getTransaction
+    # ATTEMPTS (successful or not) from indexing, combined across every
+    # program's loop, in any trailing 60s window. Where the interval floor
+    # above bounds the SPACING between calls, this bounds the total VOLUME
+    # -- a genuinely sustained outage backing off exponentially can still
+    # rack up a lot of near-instant attempts early on before the backoff
+    # has grown large; this caps that regardless of what the backoff level
+    # currently is.
+    indexing_max_calls_per_minute: int = 60
     # How often the running bot snapshots RpcGateway's call stats into
     # Accounting, so `--daily-report` can show the RPC budget after the
     # fact even though that one-shot command never starts a live gateway.
@@ -341,6 +355,14 @@ def load_config_from_env(env_path: str = ".env") -> Config:
     cfg.telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     cfg.db_path = os.environ.get("DB_PATH", cfg.db_path)
+    # Previously only settable by constructing Config() directly in Python
+    # (e.g. tests) -- there was no actual way to turn pump.fun off from
+    # .env, despite enable_pumpfun_source existing as a Config field since
+    # the circuit-breaker was added. Any of "false"/"0"/"no" (any case)
+    # disables it; anything else (including unset) leaves the default True.
+    enable_pumpfun_env = os.environ.get("ENABLE_PUMPFUN")
+    if enable_pumpfun_env is not None:
+        cfg.enable_pumpfun_source = enable_pumpfun_env.strip().lower() not in ("false", "0", "no")
     return cfg
 
 

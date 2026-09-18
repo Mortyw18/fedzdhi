@@ -254,6 +254,7 @@ Telegram (`bot/alerter.py::Alerter.enabled`).
 | `TELEGRAM_CHAT_ID` | Required if `TELEGRAM_BOT_TOKEN` is set | The chat Telegram alerts are sent to. |
 | `BANKROLL_SOL` | Recommended | Feeds the ruin table and the position-size-vs-bankroll checks in `Config.validate()`. Set it to what you actually funded. |
 | `DB_PATH` | Optional | SQLite ledger path. Defaults to `data/bot.db`. |
+| `ENABLE_PUMPFUN` | Optional | Set to `false` to skip pump.fun entirely (its API 530ing for extended stretches is common; this stops the circuit breaker wasting retries on it every restart). DexScreener signals and InsiderRadar are unaffected. Default `true`. |
 
 Once `.env` is filled in, sanity-check that it loads correctly without
 starting any run that touches RPC or a wallet:
@@ -415,20 +416,47 @@ prefix, never for an ordinary rejection.
 ### Indexing's own backoff, and why it isn't scoped to "just our candidates"
 
 A follow-up report showed `indexing_rpc_failure` logging several times a
-second with the fixed 30s cooldown above doing little to stop it. Two
-concrete fixes:
+second with a fixed 30s cooldown doing little to stop it. Two rounds of
+fixes:
 
-- **A hard local rate cap** (`indexing_min_call_interval_s`, default 0.5s)
-  on the indexer's own `getTransaction` calls, independent of how fast
-  `logsSubscribe` notifications actually arrive. "Several notifications a
-  second" can no longer become "several RPC calls a second" from this loop
-  alone, even before any failure has happened to trigger backoff.
-- **Exponential, not flat, backoff** once `indexing_max_consecutive_rpc_failures`
-  is crossed (`indexing_rpc_failure_backoff_base_s` doubling each time the
-  threshold is crossed again without an intervening success, capped at
-  `indexing_rpc_failure_backoff_max_s`). A flat cooldown meant a genuinely
-  sustained outage got retried on a fixed schedule forever -- fail fast,
-  pause 30s, fail fast again the instant the pause ended.
+**First round**: a hard local rate cap (`indexing_min_call_interval_s`,
+default 0.5s) on the indexer's own `getTransaction` calls, and exponential
+(not flat) backoff once a consecutive-failure threshold was crossed.
+
+**This didn't actually fix it.** A follow-up report showed
+`indexing_rpc_failure` *still* logging every 1-3s continuously, not
+growing. Two real bugs, both now fixed:
+
+- **The backoff and rate-cap state was per-loop, but Orchestrator runs TWO
+  concurrent indexing loops** (one per entry in `INDEXED_PROGRAM_IDS` --
+  Raydium AMM v4 and pump.fun's bonding curve). One program's loop backing
+  off did nothing to stop the OTHER program's loop from continuing to fail
+  on its own independent schedule at the same time -- from the logs, two
+  loops each failing every ~3-4s but offset from each other looks
+  identical to "no backoff at all, failing every 1-3s." All of this state
+  (`indexing_min_call_interval_s`'s spacing, the backoff window, and a new
+  `indexing_max_calls_per_minute` cap) is now genuinely global: every
+  concurrent indexing loop checks and shares the SAME `_indexing_skip_reason()`
+  gate before every notification, so one loop's failure now stops every
+  other loop's attempts too, immediately.
+- **`RpcGateway.call()`'s own internal retry loop (3 attempts by default,
+  with sleeps between) was running on top of indexing's separate backoff
+  on every single call**, adding up to ~1.5s of retry-internal wall time
+  per failing notification regardless of what indexing's own backoff
+  thought it was doing. Indexing now passes `max_retries=1` to `call()`
+  for `getTransaction`, so its own exponential backoff -- now starting
+  from the very FIRST failure, not after a grace threshold, doubling every
+  consecutive failure (`indexing_rpc_failure_backoff_base_s=2.0s` up to
+  `indexing_rpc_failure_backoff_max_s=60.0s`) -- is the sole authority over
+  retry timing for this call site.
+
+Also added: **permanent method rejection detection.** A 403 from the
+provider, or a JSON-RPC error that reads like "method not available on
+this plan," now disables that method in `RpcGateway` for the rest of the
+run -- every subsequent call to it fails instantly, with zero network I/O,
+instead of paying a full retry cycle forever. `rpc_method_disabled` logs
+once when this happens; `--daily-report` / the heartbeat log's
+`rpc_disabled_methods` field show what's currently disabled.
 
 A third ask -- "index forward from new pool creations instead of broad
 program-wide scans" -- is *not* implemented, deliberately, and it's worth

@@ -1,10 +1,21 @@
-"""Orchestrator: the indexing pipeline must be the first thing to back off
-when RPC budget is tight (it's background learning, not a trade waiting on
-a price). Its own RpcOutage failures must degrade gracefully (log + a
-local self-throttle) and must NEVER touch the kill switch -- an overnight
-run tripped the kill switch from this exact loop within ~18s of startup
-while a plain curl to the same endpoint worked fine. The kill switch's
-RPC-outage counter is now fed exclusively by TokenSafety's verdicts in
+"""Orchestrator's indexing throttles: RPC budget priority, rate cap,
+calls/min cap, and exponential backoff, all GLOBAL/SHARED across every
+concurrent _index_program_loop task (Orchestrator runs one per entry in
+INDEXED_PROGRAM_IDS -- currently Raydium AMM v4 and pump.fun's bonding
+curve, running concurrently).
+
+That "global" property is load-bearing, not incidental: an earlier
+version kept this state per-instance but the actual pause (an
+await-sleep) only affected the ONE task that triggered it. With two
+programs' loops running concurrently, one backing off did nothing to stop
+the OTHER program's loop from continuing to fail on its own schedule at
+the same time -- from the logs, that looked exactly like "no backoff at
+all, fixed-interval retries every 1-3s," which is exactly what was
+reported. test_two_concurrent_loops_share_one_backoff_window below is the
+regression test for that specific bug.
+
+Indexing's own RPC failures must also degrade gracefully and NEVER touch
+the kill switch -- that's fed exclusively by TokenSafety's verdicts in
 evaluate_candidate (see test_evaluate_candidate_rpc_outage.py), the
 price-critical path a buy is actually gated on.
 """
@@ -16,7 +27,7 @@ from unittest import mock
 from bot.config import Config
 from bot.models import Mode
 from bot.orchestrator import Orchestrator
-from bot.rpc_gateway import RpcOutage
+from bot.rpc_gateway import RpcMethodDisabled, RpcOutage
 
 
 class _FakeBudget:
@@ -33,11 +44,17 @@ class _AlwaysOutageRpc:
 
     def __init__(self) -> None:
         self.call_count = 0
+        self.calls: list[tuple] = []  # (method, max_retries) per call, for asserting the max_retries=1 override
         self.budget = _FakeBudget(usage_pct=0.0)
+        self._disabled: set[str] = set()
 
-    def call(self, method, params=None):
+    def call(self, method, params=None, max_retries=None):
         self.call_count += 1
+        self.calls.append((method, max_retries))
         raise RpcOutage("simulated outage")
+
+    def is_method_disabled(self, method):
+        return method in self._disabled
 
 
 class _AlwaysSucceedsRpc:
@@ -47,10 +64,30 @@ class _AlwaysSucceedsRpc:
     def __init__(self) -> None:
         self.call_count = 0
         self.budget = _FakeBudget(usage_pct=0.0)
+        self._disabled: set[str] = set()
 
-    def call(self, method, params=None):
+    def call(self, method, params=None, max_retries=None):
         self.call_count += 1
         return {"meta": {"preTokenBalances": [], "postTokenBalances": []}, "slot": 1, "transaction": {"message": {"accountKeys": []}}}
+
+    def is_method_disabled(self, method):
+        return method in self._disabled
+
+
+class _AlwaysMethodDisabledRpc:
+    """Every call raises RpcMethodDisabled -- simulates a method RpcGateway
+    already detected as permanently rejected (403 / plan-gated)."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.budget = _FakeBudget(usage_pct=0.0)
+
+    def call(self, method, params=None, max_retries=None):
+        self.call_count += 1
+        raise RpcMethodDisabled(f"{method} permanently disabled this run")
+
+    def is_method_disabled(self, method):
+        return True
 
 
 class _FakeWs:
@@ -71,6 +108,7 @@ def _build_orchestrator(tmp_path) -> Orchestrator:
         log_dir=str(tmp_path / "logs"),
         kill_switch_state_path=str(tmp_path / "kill_switch_state.json"),
         indexing_max_rpc_budget_pct=0.50,
+        indexing_min_call_interval_s=0.0,  # isolated per-test below where the rate cap itself is what's tested
     )
     cfg.validate()
     return Orchestrator(cfg)
@@ -114,8 +152,47 @@ def test_indexing_not_skipped_below_its_ceiling_even_if_nonzero(tmp_path):
     assert orch._indexing_skip_reason() is None
 
 
+def test_indexing_skipped_when_method_already_disabled(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysMethodDisabledRpc()
+    reason = orch._indexing_skip_reason()
+    assert reason is not None
+    assert "permanently disabled" in reason
+
+
+def test_indexing_skipped_during_an_active_backoff_window(tmp_path):
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch._indexing_backoff_until = time.monotonic() + 30.0
+    reason = orch._indexing_skip_reason()
+    assert reason is not None
+    assert "backing off" in reason
+
+
+def test_indexing_skipped_when_calls_per_minute_cap_reached(tmp_path):
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch.config.indexing_max_calls_per_minute = 3
+    now = time.monotonic()
+    orch._indexing_call_timestamps.extend([now, now, now])
+    reason = orch._indexing_skip_reason()
+    assert reason is not None
+    assert "calls/min" in reason
+
+
+def test_stale_call_timestamps_age_out_of_the_per_minute_window(tmp_path):
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch.config.indexing_max_calls_per_minute = 3
+    orch._indexing_call_timestamps.extend([time.monotonic() - 90.0] * 3)  # 90s ago -- outside the 60s window
+    assert orch._indexing_skip_reason() is None
+
+
 # ----------------------------------------------------------------------
-# _index_program_loop: latched alert + self-throttle end to end
+# _index_program_loop: end to end
 # ----------------------------------------------------------------------
 
 
@@ -129,17 +206,32 @@ def test_index_loop_never_touches_kill_switch_on_sustained_rpc_outage(tmp_path):
 
     async def drive() -> None:
         orch.stop_event = asyncio.Event()
-        with mock.patch("bot.orchestrator.asyncio.sleep", new=mock.AsyncMock()):
-            await orch._index_program_loop("SomeProgram")
+        await orch._index_program_loop("SomeProgram")
 
     asyncio.run(drive())
 
-    # Every single notification is attempted (no skip kicks in, since the
-    # kill switch never halts and the fake budget stays at 0) -- indexing's
-    # own RPC failures degrade locally and never alert or halt anything.
-    assert orch.rpc.call_count == 20
     assert orch.kill_switch.is_halted() is False
     assert alerts == []
+
+
+def test_index_loop_calls_getTransaction_with_max_retries_one(tmp_path):
+    """RpcGateway's own internal retry loop (up to 3 attempts, with sleeps
+    between) running on top of indexing's own backoff was what actually
+    produced a "fixed ~1-3s interval, no backoff" pattern in the logs --
+    not an absence of backoff. Indexing must ask for exactly one attempt
+    per call so its own backoff is the only thing controlling retry
+    timing."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch._ws = _FakeWs(_notifications(1))
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    assert orch.rpc.calls == [("getTransaction", 1)]
 
 
 def test_index_loop_logs_method_and_error_on_each_rpc_failure(tmp_path):
@@ -159,8 +251,7 @@ def test_index_loop_logs_method_and_error_on_each_rpc_failure(tmp_path):
 
     async def drive() -> None:
         orch.stop_event = asyncio.Event()
-        with mock.patch("bot.orchestrator.asyncio.sleep", new=mock.AsyncMock()):
-            await orch._index_program_loop("SomeProgram")
+        await orch._index_program_loop("SomeProgram")
 
     asyncio.run(drive())
 
@@ -171,73 +262,80 @@ def test_index_loop_logs_method_and_error_on_each_rpc_failure(tmp_path):
     assert "simulated outage" in fields["error"]
 
 
-def test_index_loop_backs_off_exponentially_after_threshold_then_self_heals(tmp_path):
+def test_index_loop_backs_off_exponentially_from_the_first_failure(tmp_path):
+    """No grace threshold -- backoff starts on failure #1 and doubles each
+    consecutive failure after that (base=2s here: 2, 4, 8, 16, ...),
+    capped. _indexing_skip_reason is bypassed here (always returns None)
+    so every one of the 4 notifications actually reaches rpc.call() --
+    this isolates the backoff MATH from "does the shared skip gate
+    correctly stop further attempts," which is covered separately by
+    test_indexing_skipped_during_an_active_backoff_window and
+    test_two_concurrent_loops_share_one_backoff_window."""
+    import logging
+
     orch = _build_orchestrator(tmp_path)
-    orch.config.indexing_max_consecutive_rpc_failures = 3
-    orch.config.indexing_min_call_interval_s = 0.0  # isolate backoff from the separate rate-cap test below
+    orch.config.indexing_rpc_failure_backoff_base_s = 2.0
+    orch.config.indexing_rpc_failure_backoff_max_s = 60.0
     orch.rpc = _AlwaysOutageRpc()
-    orch._ws = _FakeWs(_notifications(6))  # exactly two full thresholds' worth
-
-    sleep_calls: list[float] = []
-
-    async def _fake_sleep(seconds):
-        sleep_calls.append(seconds)
-
-    async def drive() -> None:
-        orch.stop_event = asyncio.Event()
-        with mock.patch("bot.orchestrator.asyncio.sleep", new=_fake_sleep):
-            await orch._index_program_loop("SomeProgram")
-
-    asyncio.run(drive())
-
-    # Every notification is still attempted (degrading gracefully means
-    # pausing between bursts, not giving up) -- but every 3rd consecutive
-    # failure triggers a backoff sleep and resets the failure counter, so a
-    # sustained outage self-throttles instead of hammering the endpoint.
-    # The backoff itself grows each time the threshold is crossed again
-    # without an intervening success (base=5s -> 5, 10, 20, ...) instead of
-    # retrying on the same fixed schedule forever.
-    assert orch.rpc.call_count == 6
-    assert sleep_calls == [5.0, 10.0]
-    assert orch._indexing_rpc_consecutive_failures == 0
-    assert orch._indexing_rpc_backoff_level == 2
-
-
-def test_index_loop_backoff_level_resets_on_a_success(tmp_path):
-    orch = _build_orchestrator(tmp_path)
-    orch.config.indexing_max_consecutive_rpc_failures = 2
-    orch.config.indexing_min_call_interval_s = 0.0
-
-    calls = {"n": 0}
-
-    class _FailTwiceThenSucceed:
-        budget = _FakeBudget(usage_pct=0.0)
-
-        def call(self, method, params=None):
-            calls["n"] += 1
-            if calls["n"] <= 2:
-                raise RpcOutage("simulated outage")
-            return {"meta": {"preTokenBalances": [], "postTokenBalances": []}, "slot": 1, "transaction": {"message": {"accountKeys": []}}}
-
-    orch.rpc = _FailTwiceThenSucceed()
-    # 2 failures (crosses the threshold=2, backoff_level -> 1) then 2 more
-    # notifications that succeed and reset the backoff level back to 0.
     orch._ws = _FakeWs(_notifications(4))
+    orch._indexing_skip_reason = lambda: None
 
-    sleep_calls: list[float] = []
-
-    async def _fake_sleep(seconds):
-        sleep_calls.append(seconds)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    orch.logger.addHandler(handler)
 
     async def drive() -> None:
         orch.stop_event = asyncio.Event()
-        with mock.patch("bot.orchestrator.asyncio.sleep", new=_fake_sleep):
-            await orch._index_program_loop("SomeProgram")
+        await orch._index_program_loop("SomeProgram")
 
     asyncio.run(drive())
 
-    assert sleep_calls == [orch.config.indexing_rpc_failure_backoff_base_s]  # only the one, level-1 backoff
-    assert orch._indexing_rpc_backoff_level == 0  # reset by the successes that followed
+    assert orch.rpc.call_count == 4
+    assert orch._indexing_rpc_consecutive_failures == 4
+    backoffs = [r.fields["backoff_s"] for r in records if r.getMessage() == "indexing_backing_off"]
+    assert backoffs == [2.0, 4.0, 8.0, 16.0]
+
+
+def test_two_concurrent_loops_share_one_backoff_window(tmp_path):
+    """The regression test for the actual reported bug: two programs'
+    indexing loops running concurrently (Orchestrator runs one per entry
+    in INDEXED_PROGRAM_IDS, sharing one Orchestrator instance -- and
+    therefore one _indexing_backoff_until). Program A's loop failing and
+    setting the shared backoff must immediately stop program B's loop from
+    attempting further calls too -- not just pause the loop that happened
+    to fail, which is what an earlier, per-loop-state version got wrong
+    (each loop backed off independently, so one loop's pause never
+    stopped the other from continuing to fail on its own schedule)."""
+    orch = _build_orchestrator(tmp_path)
+    orch.config.indexing_rpc_failure_backoff_base_s = 5.0
+    orch.rpc = _AlwaysOutageRpc()
+
+    # Program A's loop: one failing notification sets the shared backoff.
+    orch._ws = _FakeWs(_notifications(1))
+
+    async def run_a() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("ProgramA")
+
+    asyncio.run(run_a())
+    assert orch.rpc.call_count == 1
+    assert orch._indexing_backoff_until > 0.0
+
+    # Program B's loop, a separate task in production but the SAME
+    # Orchestrator instance: every one of its 10 notifications must be
+    # skipped by the backoff A just set, without ever calling rpc.call().
+    calls_before_b = orch.rpc.call_count
+    orch._ws = _FakeWs(_notifications(10))
+
+    async def run_b() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("ProgramB")
+
+    asyncio.run(run_b())
+
+    assert orch.rpc.call_count == calls_before_b  # B made ZERO calls
+    assert orch._indexing_skipped_count == 10
 
 
 def test_index_loop_rate_caps_successive_calls_regardless_of_failure_state(tmp_path):
@@ -268,6 +366,24 @@ def test_index_loop_rate_caps_successive_calls_regardless_of_failure_state(tmp_p
     # notifications a second" from becoming "several RPC calls a second."
     assert len(sleep_calls) == 2
     assert all(0 < s <= orch.config.indexing_min_call_interval_s for s in sleep_calls)
+
+
+def test_index_loop_stops_calling_a_permanently_disabled_method(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysMethodDisabledRpc()
+    orch._ws = _FakeWs(_notifications(10))
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    # is_method_disabled() returns True from the very first check, so
+    # _indexing_skip_reason() drops every notification before ever calling
+    # rpc.call() at all.
+    assert orch.rpc.call_count == 0
+    assert orch._indexing_skipped_count == 10
 
 
 def test_index_loop_skips_all_notifications_when_budget_is_tight(tmp_path):

@@ -64,12 +64,28 @@ free-tier RPC budget, not just to survive an occasional spike:
   `--daily-report` shows a high `safety_checks` count relative to
   `signals` -- if they're close to equal, the cache isn't doing its job
   (check `verdict_cache_ttl_s` and `verdict_cache_liquidity_change_pct`).
-- **Indexing has its own local rate cap and exponential backoff**,
+- **Indexing has its own rate cap, calls/min ceiling, and exponential
+  backoff, all shared globally across every concurrent indexing loop** --
   separate from and in addition to the RPC-budget-ceiling throttle above
-  -- see README.md's "Indexing's own backoff" section. Neither one costs
-  a single `RpcGateway.call()` when it triggers; both exist specifically
-  to stop a sustained RPC outage from turning into a tight retry loop the
-  same way the 429 cooldown above does for rate limiting specifically.
+  -- see README.md's "Indexing's own backoff" section. None of the three
+  cost a single `RpcGateway.call()` when they trigger; all three exist
+  specifically to stop a sustained RPC outage from turning into a tight
+  retry loop the same way the 429 cooldown above does for rate limiting
+  specifically. Indexing's `getTransaction` calls also pass
+  `max_retries=1` to `RpcGateway.call()` -- indexing runs its own separate
+  backoff across repeated calls, and letting `RpcGateway`'s own internal
+  retry loop (3 attempts by default) also fire on every single call was
+  costing up to ~1.5s of extra retry time per failure regardless of what
+  indexing's own backoff was doing.
+- **A method RpcGateway detects as permanently rejected (403, or a
+  JSON-RPC error that reads like "not available on this plan") is
+  disabled for the rest of the run.** Every subsequent call to it fails
+  instantly, with zero network I/O -- this matters most for a Helius free
+  tier, where some enhanced/paid-tier-only methods return exactly this
+  shape of error, and retrying one forever on every single call would
+  otherwise burn budget and time for no possible benefit. `rpc_method_disabled`
+  logs once when this happens; `disabled_methods` in `get_call_stats()` /
+  `--daily-report` shows what's currently off.
 
 The RPC budget itself is audited, not just capped: `RpcGateway` tracks
 per-method call counts and calls-per-minute live, and the running bot

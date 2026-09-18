@@ -40,6 +40,49 @@ class RpcRateLimited(RpcError):
     """
 
 
+class RpcMethodDisabled(RpcOutage):
+    """A method looks PERMANENTLY rejected, not transiently failing: a 403
+    from the provider, or a JSON-RPC error whose code/message says the
+    method isn't available (e.g. "not supported on this plan"). Retrying
+    this is pointless until the provider config changes -- RpcGateway
+    remembers it for the rest of the process and every subsequent call to
+    that method fails instantly, with zero network I/O, instead of paying
+    a full retry/backoff cycle on every single call forever. Subclasses
+    RpcOutage so existing `except RpcOutage:` call sites keep working
+    unchanged; callers that need to react differently (see Orchestrator's
+    indexing loop, which stops trying the method at all rather than
+    continuing to log a failure every time) can catch this specifically.
+    """
+
+
+class _MethodUnavailable(RpcError):
+    """Internal signal raised by _post -- caught inside call(), where
+    `method` is in scope to update _disabled_methods and turn this into
+    the caller-visible RpcMethodDisabled. Never escapes _post/call."""
+
+
+def _looks_like_method_unavailable(error: Any) -> bool:
+    """Heuristic over a JSON-RPC error object: does this look like "this
+    method isn't available to you," not an ordinary transient failure?
+    JSON-RPC code -32601 is the standard "Method not found." The message
+    substrings cover what free-tier providers commonly say instead of a
+    clean error code when a method is plan-gated. False positives here
+    just mean a few retries are skipped early -- not silent -- since
+    rpc_method_disabled is always logged; false negatives just mean the
+    old (safe, if wasteful) retry-forever behavior for that one message
+    shape, so this is intentionally over-inclusive rather than exact.
+    """
+    if not isinstance(error, dict):
+        return False
+    if error.get("code") == -32601:
+        return True
+    message = str(error.get("message", "")).lower()
+    return any(
+        phrase in message
+        for phrase in ("not available", "not allowed", "not supported", "not enabled", "restricted", "requires a paid plan", "upgrade")
+    )
+
+
 @dataclass
 class RateBudget:
     """Sliding-window budget tracker over a 10s window, with a latched alert.
@@ -114,6 +157,14 @@ class RpcGateway:
         self._cooldown_until = 0.0
         self._rate_limit_backoff_level = 0
 
+        # Methods detected as permanently rejected (403, or a JSON-RPC
+        # error that looks like "not available on this plan") -- see
+        # RpcMethodDisabled. Checked at the top of call() so a disabled
+        # method fails instantly, with zero network I/O, instead of paying
+        # a full retry cycle every single time it's called for the rest of
+        # the run.
+        self._disabled_methods: set[str] = set()
+
         # Per-method call counters, for the RPC budget audit in the daily
         # report. Every attempted HTTP request counts, including retries --
         # a retried request still consumes one unit of the provider's budget.
@@ -148,7 +199,11 @@ class RpcGateway:
             "rate_limit_per_10s": self.budget.limit_per_window,
             "top_methods": dict(self.call_counts.most_common(8)),
             "total_calls": sum(self.call_counts.values()),
+            "disabled_methods": sorted(self._disabled_methods),
         }
+
+    def is_method_disabled(self, method: str) -> bool:
+        return method in self._disabled_methods
 
     def _wait_out_cooldown(self, method: str) -> None:
         remaining = self._cooldown_until - time.monotonic()
@@ -161,8 +216,13 @@ class RpcGateway:
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             raise RpcRateLimited(f"429 rate limited by {url} (Retry-After={retry_after})")
+        if resp.status_code == 403:
+            raise _MethodUnavailable(f"403 Forbidden from {url}")
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if "error" in data and _looks_like_method_unavailable(data["error"]):
+            raise _MethodUnavailable(f"{payload['method']} RPC error: {data['error']}")
+        return data
 
     def _trip_rate_limit_cooldown(self, method: str, exc: Exception) -> None:
         self._rate_limit_backoff_level += 1
@@ -176,7 +236,7 @@ class RpcGateway:
             extra={"fields": {"method": method, "backoff_s": backoff, "level": self._rate_limit_backoff_level, "detail": str(exc)}},
         )
 
-    def call(self, method: str, params: Optional[list] = None) -> Any:
+    def call(self, method: str, params: Optional[list] = None, max_retries: Optional[int] = None) -> Any:
         """JSON-RPC call with retry/backoff, then failover, then RpcOutage.
 
         A 429 is never retried immediately: it trips a shared cooldown (see
@@ -186,12 +246,28 @@ class RpcGateway:
         different from an ordinary transient failure's short fixed backoff
         below -- retrying quickly into an active rate limit is exactly what
         turns one slow endpoint into a budget death spiral.
+
+        `max_retries` overrides the instance default for this one call --
+        Orchestrator's indexing loop passes 1: it runs its own, separate
+        exponential backoff across repeated calls to this same method (see
+        _index_program_loop), and letting THIS retry loop also sleep and
+        retry internally on every single call was masking that outer
+        backoff, making a genuinely backing-off caller look like it was
+        retrying on a fixed ~1-2s schedule from the logs alone.
+
+        A method that looks PERMANENTLY rejected (403, or a JSON-RPC error
+        that reads like "not available on this plan") is never retried at
+        all, on any URL or attempt -- see RpcMethodDisabled.
         """
+        if method in self._disabled_methods:
+            raise RpcMethodDisabled(f"{method} was disabled earlier this run (looked permanently rejected) -- not retrying")
+
+        effective_max_retries = self.max_retries if max_retries is None else max_retries
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
         last_exc: Optional[Exception] = None
 
         for url in [u for u in (self.primary_url, self.failover_url) if u]:
-            for attempt in range(self.max_retries):
+            for attempt in range(effective_max_retries):
                 self._wait_out_cooldown(method)
                 self._record_call(method)
                 self.budget.record_and_check()
@@ -203,6 +279,10 @@ class RpcGateway:
                     self._rate_limit_backoff_level = 0
                     self._cooldown_until = 0.0
                     return data.get("result")
+                except _MethodUnavailable as exc:
+                    self._disabled_methods.add(method)
+                    self.logger.error("rpc_method_disabled", extra={"fields": {"method": method, "detail": str(exc)}})
+                    raise RpcMethodDisabled(f"{method} permanently disabled this run: {exc}") from exc
                 except RpcRateLimited as exc:
                     last_exc = exc
                     self._consecutive_failures += 1
@@ -213,7 +293,7 @@ class RpcGateway:
                 except (requests.RequestException, RpcError, json.JSONDecodeError) as exc:
                     last_exc = exc
                     self._consecutive_failures += 1
-                    if attempt < self.max_retries - 1:
+                    if attempt < effective_max_retries - 1:
                         time.sleep(min(2 ** attempt * 0.5, 4.0))
             # exhausted retries on this URL, try failover if any
 

@@ -74,11 +74,14 @@ class FakeRpc:
     def confirm_signature(self, signature, timeout_s=45.0, poll_interval_s=1.5):
         return self.confirm_result
 
-    def call(self, method, params=None):
+    def call(self, method, params=None, max_retries=None):
         if method == "getTransaction":
             sig = params[0]
             return self.transactions.get(sig, {"meta": {"fee": 5000, "preBalances": [0], "postBalances": [0]}})
         raise NotImplementedError(method)
+
+    def is_method_disabled(self, method):
+        return False
 
 
 class FakeQuoteResult:
