@@ -28,6 +28,7 @@ def _base_candidate(mint: str) -> Candidate:
         symbol="TEST",
         source=SignalSource.DEXSCREENER,
         liquidity_usd=50_000,
+        sells_5m=5,  # nonzero so check_honeypot's DexScreener sell-volume signal doesn't reject by default
         pump_fun_graduated=False,  # skip LP-burn plumbing; not what these tests target
     )
 

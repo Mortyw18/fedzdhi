@@ -18,6 +18,65 @@ trades are structurally faster, better informed, or both. A well-written
 bot reduces unforced errors. It does not, by itself, turn a
 negative-expectancy game positive.
 
+## The honeypot check is a proxy, not a guarantee
+
+`TokenSafety.check_honeypot` cannot truly simulate selling a token before
+this bot has bought it -- a real sell simulation needs a funded associated
+token account for that mint, and we don't have one pre-buy. Solana's
+`simulateTransaction` has no mechanism to override account state to fake
+holding the token (unlike forking an EVM chain), so a first version of
+this check that tried to simulate a real sell transaction failed with
+`AccountNotFound` on every single candidate, regardless of whether it was
+actually a honeypot. It could not pass on any token, ever -- a much worse
+failure mode than a slightly weak check, since it silently meant "this
+bot cannot buy anything" rather than "this bot is being appropriately
+cautious."
+
+What it checks now instead, cheaply, on a free RPC tier:
+
+1. Jupiter quotes a sell-side route for our exact holdings, for a positive
+   SOL amount out. A quote is a price lookup computed from the pool's
+   on-chain reserves; it does not require holding the token, so it works
+   before buying. It also does not prove sellability at execution time --
+   a quote can exist for a pool whose actual transfer logic still reverts.
+2. For DexScreener-sourced candidates, at least one real sell happened in
+   the observed 5-minute window. pump.fun's coin feed doesn't expose this
+   data at all, so pump.fun-sourced candidates skip this signal entirely
+   rather than being unfairly rejected for a gap in the data, not the
+   token.
+3. No active Token-2022 `transferHook` extension on the mint -- the most
+   common real honeypot mechanism on current Solana launches (arbitrary
+   program logic runs on every transfer, including a sell, and can revert
+   selectively). A quote never actually invokes the hook, so this is the
+   one signal here that catches what signal 1 structurally cannot.
+
+None of this is a guarantee. A sufficiently patient rug can pass all
+three: route liquidity that's real but thin, sell volume from wash
+trading or the deployer's own wallets, and a malicious mechanism that
+isn't a Token-2022 transfer hook (a custom AMM program with its own
+sell-blocking logic, for instance, which check 1's quote would also fail
+to catch if the AMM itself refuses to route the sell -- but would then
+correctly reject on signal 1). Treat a passing honeypot check as "the
+cheapest available signals didn't fire," not as "confirmed sellable."
+
+## Graduation lookups only work for pump.fun-origin tokens
+
+`check_lp_or_graduation`'s LP-burn verification only has two paths that
+actually resolve to a real answer: a pump.fun-origin mint (detected by its
+vanity `...pump` address suffix), whose bonding-curve/graduation state is
+asked directly from pump.fun's own API, and a candidate that already
+carries a known `lp_mint` with a resolvable burn percentage on-chain. A
+non-pump.fun DEX-native launch with no independently-known `lp_mint`
+fails this check closed -- rejected, not passed on uncertainty -- because
+this bot has no general way to resolve an arbitrary Raydium, Orca, or
+Meteora pool's LP mint from just a pool/pair address without decoding
+that DEX's own binary account layout (each is different, and none of them
+are `getAccountInfo`-with-`jsonParsed`-friendly the way SPL Token and
+System accounts are). If the daily report's rejection breakdown shows
+`lp_burned_or_graduated` dominating for candidates whose mint doesn't end
+in `pump`, that's this limitation, not a bug -- and not something safe to
+work around by trusting an unresolved LP mint on faith.
+
 ## The likely M3 outcome
 
 If you run this bot honestly for the full 14-day paper period, the most

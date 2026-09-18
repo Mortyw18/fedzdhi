@@ -40,6 +40,19 @@ class _AlwaysOutageRpc:
         raise RpcOutage("simulated outage")
 
 
+class _AlwaysSucceedsRpc:
+    """Every getTransaction call succeeds with an empty-but-well-formed tx
+    -- isolates the rate cap from the failure/backoff path entirely."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.budget = _FakeBudget(usage_pct=0.0)
+
+    def call(self, method, params=None):
+        self.call_count += 1
+        return {"meta": {"preTokenBalances": [], "postTokenBalances": []}, "slot": 1, "transaction": {"message": {"accountKeys": []}}}
+
+
 class _FakeWs:
     def __init__(self, notifications: list[dict]) -> None:
         self._notifications = notifications
@@ -158,9 +171,10 @@ def test_index_loop_logs_method_and_error_on_each_rpc_failure(tmp_path):
     assert "simulated outage" in fields["error"]
 
 
-def test_index_loop_backs_off_after_threshold_then_self_heals(tmp_path):
+def test_index_loop_backs_off_exponentially_after_threshold_then_self_heals(tmp_path):
     orch = _build_orchestrator(tmp_path)
     orch.config.indexing_max_consecutive_rpc_failures = 3
+    orch.config.indexing_min_call_interval_s = 0.0  # isolate backoff from the separate rate-cap test below
     orch.rpc = _AlwaysOutageRpc()
     orch._ws = _FakeWs(_notifications(6))  # exactly two full thresholds' worth
 
@@ -178,11 +192,82 @@ def test_index_loop_backs_off_after_threshold_then_self_heals(tmp_path):
 
     # Every notification is still attempted (degrading gracefully means
     # pausing between bursts, not giving up) -- but every 3rd consecutive
-    # failure triggers one cooldown sleep and resets the counter, so a
+    # failure triggers a backoff sleep and resets the failure counter, so a
     # sustained outage self-throttles instead of hammering the endpoint.
+    # The backoff itself grows each time the threshold is crossed again
+    # without an intervening success (base=5s -> 5, 10, 20, ...) instead of
+    # retrying on the same fixed schedule forever.
     assert orch.rpc.call_count == 6
-    assert sleep_calls == [orch.config.indexing_rpc_failure_cooldown_s] * 2
+    assert sleep_calls == [5.0, 10.0]
     assert orch._indexing_rpc_consecutive_failures == 0
+    assert orch._indexing_rpc_backoff_level == 2
+
+
+def test_index_loop_backoff_level_resets_on_a_success(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    orch.config.indexing_max_consecutive_rpc_failures = 2
+    orch.config.indexing_min_call_interval_s = 0.0
+
+    calls = {"n": 0}
+
+    class _FailTwiceThenSucceed:
+        budget = _FakeBudget(usage_pct=0.0)
+
+        def call(self, method, params=None):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RpcOutage("simulated outage")
+            return {"meta": {"preTokenBalances": [], "postTokenBalances": []}, "slot": 1, "transaction": {"message": {"accountKeys": []}}}
+
+    orch.rpc = _FailTwiceThenSucceed()
+    # 2 failures (crosses the threshold=2, backoff_level -> 1) then 2 more
+    # notifications that succeed and reset the backoff level back to 0.
+    orch._ws = _FakeWs(_notifications(4))
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        with mock.patch("bot.orchestrator.asyncio.sleep", new=_fake_sleep):
+            await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    assert sleep_calls == [orch.config.indexing_rpc_failure_backoff_base_s]  # only the one, level-1 backoff
+    assert orch._indexing_rpc_backoff_level == 0  # reset by the successes that followed
+
+
+def test_index_loop_rate_caps_successive_calls_regardless_of_failure_state(tmp_path):
+    """The rate cap is a hard floor on call spacing, independent of whether
+    calls are succeeding or failing -- this isolates it with an RPC that
+    always succeeds, so nothing here is about the backoff path at all."""
+    orch = _build_orchestrator(tmp_path)
+    orch.config.indexing_min_call_interval_s = 0.3
+    orch.rpc = _AlwaysSucceedsRpc()
+    orch._ws = _FakeWs(_notifications(3))
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        with mock.patch("bot.orchestrator.asyncio.sleep", new=_fake_sleep):
+            await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    assert orch.rpc.call_count == 3
+    # The first call never waits (no prior call this run), but back-to-back
+    # notifications processed in the same tight loop each have to wait
+    # nearly a full interval -- this is exactly what stops "several
+    # notifications a second" from becoming "several RPC calls a second."
+    assert len(sleep_calls) == 2
+    assert all(0 < s <= orch.config.indexing_min_call_interval_s for s in sleep_calls)
 
 
 def test_index_loop_skips_all_notifications_when_budget_is_tight(tmp_path):

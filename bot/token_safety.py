@@ -17,10 +17,30 @@ from typing import Any, Callable, Optional
 import requests
 
 from bot.jupiter_client import JupiterClient, JupiterError, SOL_MINT
-from bot.models import Candidate, SafetyCheckResult, SafetyVerdict, WalletBuyRecord
+from bot.models import Candidate, SafetyCheckResult, SafetyVerdict, SignalSource, WalletBuyRecord
 from bot.rpc_gateway import RpcGateway, RpcError
 
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+# pump.fun mints are vanity-searched to end in this suffix -- a cheap,
+# zero-RPC heuristic for "this token's origin is pump.fun," independent of
+# whether SignalEngine happened to discover it via pump.fun's own poller
+# (which sets Candidate.pump_fun_graduated) or via DexScreener (which never
+# does -- see check_lp_or_graduation).
+PUMPFUN_MINT_SUFFIX = "pump"
+PUMPFUN_COIN_INFO_URL = "https://frontend-api.pump.fun/coins/{mint}"
+# Kept in sync manually with signal_engine.py's PUMPFUN_NEW_COINS_URL
+# headers -- frontend-api.pump.fun sits behind Cloudflare and has been
+# observed 530ing scripted clients with no browser-like User-Agent.
+PUMPFUN_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://pump.fun/",
+    "Origin": "https://pump.fun",
+}
 
 BURN_ADDRESSES = {
     "1nc1nerator11111111111111111111111111111111",
@@ -62,6 +82,8 @@ class TokenSafety:
         bundled_launch_min_distinct_tokens: int = 15,
         bundle_cluster_min_wallets: int = 3,
         rugcheck_session: Optional[requests.Session] = None,
+        pumpfun_session: Optional[requests.Session] = None,
+        enable_pumpfun_lookups: bool = True,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.rpc = rpc
@@ -71,6 +93,11 @@ class TokenSafety:
         self.bundled_launch_min_distinct_tokens = bundled_launch_min_distinct_tokens
         self.bundle_cluster_min_wallets = bundle_cluster_min_wallets
         self.rugcheck_session = rugcheck_session or requests.Session()
+        # Same on/off switch as SignalEngine's enable_pumpfun_source: pump.fun's
+        # API is the same unofficial, occasionally-530ing endpoint either way,
+        # so one config flag disables both call sites at once.
+        self.pumpfun_session = pumpfun_session or requests.Session()
+        self.enable_pumpfun_lookups = enable_pumpfun_lookups
         self.logger = logger or logging.getLogger("memebot.token_safety")
 
         # Burn addresses and AMM program IDs never change, so once we've
@@ -112,12 +139,40 @@ class TokenSafety:
 
     def check_lp_or_graduation(self, candidate: Candidate) -> SafetyCheckResult:
         if candidate.pump_fun_graduated is False:
+            # Already confirmed un-graduated by SignalEngine's own pump.fun
+            # poller this cycle -- cheapest possible case, no extra lookup.
             return SafetyCheckResult(
                 "lp_burned_or_graduated", True, "pump.fun bonding curve (pre-graduation), no separate LP to rug"
             )
+
+        if candidate.mint.endswith(PUMPFUN_MINT_SUFFIX):
+            # Covers BOTH "discovered via DexScreener, so
+            # Candidate.pump_fun_graduated was never set at all" (the gap
+            # that made every pump.fun-origin token found via DexScreener's
+            # token-profiles/boosts discovery permanently unrejectable --
+            # lp_mint is never populated by parse_dexscreener_pair either)
+            # AND "SignalEngine's poller already said pump_fun_graduated is
+            # True." Either way, pump.fun's own API is the authoritative,
+            # current source for bonding-curve/graduation state for its own
+            # tokens -- ask it directly instead of rejecting a token that IS
+            # pump.fun-origin just because we didn't happen to learn that
+            # from SignalEngine's separate pump.fun poller this cycle.
+            return self._check_pumpfun_graduation(candidate.mint)
+
         if not candidate.lp_mint:
+            # Not pump.fun-origin (or at least doesn't look it) and we have
+            # no LP mint to check burn status on. This bot currently has no
+            # way to resolve a generic Raydium/Orca/Meteora pool's LP mint
+            # from just a pair/pool address without decoding that DEX's own
+            # binary account layout (each one is different, and none of
+            # them are JSON-parseable via getAccountInfo) -- see HONESTY.md.
+            # Fails closed: an unverifiable non-pump.fun launch is rejected,
+            # not passed through on uncertainty, unlike the pump.fun lookup
+            # above (which has an authoritative source to ask).
             return SafetyCheckResult(
-                "lp_burned_or_graduated", False, "no LP mint known and token is not an un-graduated pump.fun token"
+                "lp_burned_or_graduated", False,
+                "no LP mint known and no pump.fun heritage to resolve graduation from -- cannot "
+                "currently verify LP burn status for a non-pump.fun DEX-native launch",
             )
         try:
             largest = self.rpc.get_token_largest_accounts(candidate.lp_mint)
@@ -138,6 +193,52 @@ class TokenSafety:
                 "lp_burned_or_graduated", False, f"only {locked_pct:.1%} of LP burned/locked (need >= 80%)"
             )
         return SafetyCheckResult("lp_burned_or_graduated", True, f"{locked_pct:.1%} of LP burned/locked")
+
+    def _check_pumpfun_graduation(self, mint: str) -> SafetyCheckResult:
+        """Ask pump.fun's own (unofficial) API whether this specific mint
+        has graduated. Authoritative for pump.fun-origin tokens, and much
+        cheaper than decoding a Raydium pool account's binary layout to
+        answer the same question generically (see check_lp_or_graduation's
+        non-pump.fun branch, which can't do that).
+
+        A lookup failure is deliberately NOT a reject: the API is
+        unofficial and known to 530 under Cloudflare for stretches (see
+        SignalEngine's own pump.fun handling), and pump.fun is not a source
+        an attacker can reliably force offline just to slip a bad token
+        past this specific check -- every other check (holder
+        concentration, mint/freeze authority, honeypot route, price
+        impact, ...) still applies regardless. A failure here means
+        "unknown right now," not "assume it's fine forever": the verdict
+        cache's TTL (see Orchestrator) means this candidate gets a fresh
+        attempt on a later cycle rather than being permanently blocked by
+        one bad request.
+        """
+        if not self.enable_pumpfun_lookups:
+            return SafetyCheckResult(
+                "lp_burned_or_graduated", False,
+                "pump.fun lookups disabled via config (enable_pumpfun_source=False) -- cannot resolve graduation",
+            )
+        try:
+            resp = self.pumpfun_session.get(
+                PUMPFUN_COIN_INFO_URL.format(mint=mint), headers=PUMPFUN_BROWSER_HEADERS, timeout=5.0
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            return SafetyCheckResult(
+                "lp_burned_or_graduated", True,
+                f"pump.fun graduation lookup failed ({exc}) -- treating as unknown, not a reject; "
+                "will re-check on a later cycle",
+            )
+        if not bool(data.get("complete", False)):
+            return SafetyCheckResult(
+                "lp_burned_or_graduated", True,
+                "pump.fun bonding curve (pre-graduation, confirmed via API), no separate LP to rug",
+            )
+        return SafetyCheckResult(
+            "lp_burned_or_graduated", True,
+            "pump.fun graduated to Raydium (confirmed via API) -- pump.fun's migration burns the LP automatically",
+        )
 
     def _resolve_owners_batch(self, token_account_addresses: list[str]) -> dict[str, Optional[str]]:
         """{token_account_address: owner_or_None}, in ONE getMultipleAccounts
@@ -229,9 +330,72 @@ class TokenSafety:
                     )
         return SafetyCheckResult("transfer_fee_tax", True, "no active transfer-fee extension")
 
-    def check_honeypot(self, candidate: Candidate, expected_tokens_out: int, wallet_pubkey: str) -> SafetyCheckResult:
-        sellable, detail, _ = self.jupiter.simulate_sell(self.rpc, candidate.mint, expected_tokens_out, wallet_pubkey)
-        return SafetyCheckResult("honeypot", sellable, detail)
+    def check_honeypot(self, candidate: Candidate, expected_tokens_out: int, mint_info: Any = _UNFETCHED) -> SafetyCheckResult:
+        """A proxy for "can this actually be sold," not a true pre-buy
+        simulation -- see JupiterClient.check_sell_route's docstring for
+        why the old simulateTransaction-based check could never pass on
+        ANY token (it needs a funded token account we don't have before
+        buying). Three cheap, free-tier-affordable signals, in order:
+
+          1. Jupiter quotes a sell-side route with positive SOL out
+             (check_sell_route -- a price lookup, doesn't require holding
+             the token).
+          2. When the discovery source reports trade activity (DexScreener
+             only -- pump.fun's coin feed doesn't expose 5m buy/sell
+             counts), at least one real sell happened in the last 5
+             minutes. All-buys-no-sells inside a window is exactly what a
+             sell-blocking honeypot looks like from the outside.
+          3. No active Token-2022 transferHook extension on the mint.
+             Arbitrary hook logic on every transfer is the most common
+             real honeypot mechanism on current Solana token launches --
+             it can silently revert a sell that a quote alone would never
+             catch, since a quote never actually invokes the hook. Reuses
+             the same mint_info evaluate() already fetched for the
+             mint/freeze-authority and transfer-fee checks, so this costs
+             zero extra RPC calls.
+
+        None of this proves a token is safe to sell -- it proves the
+        cheapest signals available on a free RPC tier didn't fire. See
+        HONESTY.md for what this trades away versus a true simulation.
+        """
+        ok, detail, _ = self.jupiter.check_sell_route(candidate.mint, expected_tokens_out)
+        if not ok:
+            return SafetyCheckResult("honeypot", False, detail)
+
+        if candidate.source == SignalSource.DEXSCREENER and candidate.sells_5m <= 0:
+            return SafetyCheckResult(
+                "honeypot", False,
+                "sell route exists but zero observed sells in the last 5m (DexScreener) -- "
+                "indistinguishable from a sell-blocking honeypot from here",
+            )
+
+        try:
+            info = self._fetch_mint_info(candidate.mint) if mint_info is _UNFETCHED else mint_info
+        except RpcError:
+            info = None
+        if info and self._has_active_transfer_hook(info):
+            return SafetyCheckResult(
+                "honeypot", False, "Token-2022 transferHook extension active -- can silently block sells"
+            )
+
+        volume_note = (
+            f"{candidate.sells_5m} sells/5m" if candidate.source == SignalSource.DEXSCREENER
+            else "sell-volume data unavailable (pump.fun)"
+        )
+        return SafetyCheckResult("honeypot", True, f"{detail}, {volume_note}")
+
+    @staticmethod
+    def _has_active_transfer_hook(mint_info: dict) -> bool:
+        if mint_info.get("owner") != TOKEN_2022_PROGRAM_ID:
+            return False  # transferHook is a Token-2022 extension; plain SPL Token can't have one
+        parsed = mint_info.get("data", {}).get("parsed", {}).get("info", {})
+        for ext in parsed.get("extensions", []):
+            if ext.get("extension") != "transferHook":
+                continue
+            program_id = ext.get("state", {}).get("programId")
+            if program_id and program_id != "11111111111111111111111111111111111111111":
+                return True
+        return False
 
     def check_price_impact(self, candidate: Candidate, position_size_lamports: int):
         """Returns (SafetyCheckResult, QuoteResult|None). Also feeds honeypot check's amount."""
@@ -316,9 +480,15 @@ class TokenSafety:
         first_buyers: Optional[list[WalletBuyRecord]] = None,
         distinct_token_lookup: Optional[DistinctTokenLookup] = None,
     ) -> SafetyVerdict:
+        # wallet_pubkey is currently unused: check_honeypot no longer builds
+        # a real swap transaction (see its docstring), which was the only
+        # check that needed a pubkey. Kept in the signature since it's part
+        # of Orchestrator's call contract and a future check that DOES need
+        # a real wallet (e.g. a live-only, already-holding-the-token
+        # simulation) would want it without another signature change.
         checks: list[SafetyCheckResult] = []
 
-        # Fetched once and shared between the two checks that both need the
+        # Fetched once and shared between the three checks that all need the
         # mint account -- see _fetch_mint_info's docstring.
         try:
             mint_info = self._fetch_mint_info(candidate.mint)
@@ -334,7 +504,7 @@ class TokenSafety:
         checks.append(price_impact_check)
 
         if quote is not None and quote.out_amount > 0:
-            checks.append(self.check_honeypot(candidate, quote.out_amount, wallet_pubkey))
+            checks.append(self.check_honeypot(candidate, quote.out_amount, mint_info=mint_info))
         else:
             checks.append(SafetyCheckResult("honeypot", False, "skipped: no valid buy quote to size the sell test"))
 

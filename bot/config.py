@@ -106,7 +106,24 @@ class Config:
     # Manual override: set False to skip pump.fun entirely (e.g. it's been
     # 530ing for days and you're tired of the circuit breaker re-trying it
     # every restart). DexScreener signals and InsiderRadar are unaffected.
+    # Also gates TokenSafety's pump.fun graduation lookup (same API).
     enable_pumpfun_source: bool = True
+
+    # --- verdict cache ---
+    # The same mint gets rediscovered every DexScreener/pump.fun poll cycle
+    # (DexScreener always returns still-active pools; the whole point of a
+    # trend-following search is that it keeps finding what's already
+    # trending) -- without a cache, evaluate_candidate() re-runs the full,
+    # RPC/Jupiter/rugcheck/pump.fun-lookup-costing safety pipeline on the
+    # SAME mint every single cycle, forever. 20 minutes covers several
+    # DexScreener poll intervals without leaving genuinely stale data cached
+    # for too long. A big swing in the candidate's own reported liquidity
+    # (verdict_cache_liquidity_change_pct) is treated as a state-change event
+    # and bypasses the cache early even inside the TTL -- cheap to check
+    # (data we already have from discovery) and cheaper than a real
+    # state-change subscription per mint.
+    verdict_cache_ttl_s: float = 1200.0
+    verdict_cache_liquidity_change_pct: float = 0.20
 
     # --- insider radar ---
     insider_first_buyers_n: int = 50
@@ -140,12 +157,26 @@ class Config:
     # Indexing's own RPC failures (getTransaction on a logsSubscribe
     # notification) must degrade gracefully and never touch the kill switch
     # -- that's reserved for TokenSafety's price-critical checks (see
-    # KillSwitch's module docstring). Instead, after this many consecutive
-    # getTransaction failures the indexer pauses itself for
-    # indexing_rpc_failure_cooldown_s before trying again, so a real outage
-    # self-throttles instead of hammering the endpoint on every notification.
+    # KillSwitch's module docstring). After this many consecutive
+    # getTransaction failures the indexer pauses itself, growing the pause
+    # exponentially (base * 2^level, capped) each time it crosses the
+    # threshold again without an intervening success -- a flat cooldown
+    # wasn't enough under real load: a busy AMM program firing notifications
+    # several times a second can burn through `indexing_max_consecutive_rpc_failures`
+    # in under a second, take one fixed-length pause, and immediately start
+    # failing again the instant it's over, forever, if the outage is
+    # actually sustained.
     indexing_max_consecutive_rpc_failures: int = 5
-    indexing_rpc_failure_cooldown_s: float = 30.0
+    indexing_rpc_failure_backoff_base_s: float = 5.0
+    indexing_rpc_failure_backoff_max_s: float = 300.0
+    # A hard, local floor on the spacing between the indexer's OWN
+    # getTransaction attempts -- independent of how fast logsSubscribe
+    # notifications actually arrive, how the RPC budget ceiling above is
+    # doing, or the exponential backoff. "Several notifications a second"
+    # from a busy program can never turn into "several RPC calls a second"
+    # from this loop, full stop, even on the very first burst before any of
+    # the other throttles have had a chance to kick in.
+    indexing_min_call_interval_s: float = 0.5
     # How often the running bot snapshots RpcGateway's call stats into
     # Accounting, so `--daily-report` can show the RPC budget after the
     # fact even though that one-shot command never starts a live gateway.

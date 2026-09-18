@@ -153,18 +153,34 @@ class JupiterClient:
             raise JupiterError(f"swap build error: {data['error']}")
         return data  # contains swapTransaction (base64), lastValidBlockHeight
 
-    def simulate_sell(
+    def check_sell_route(
         self,
-        rpc: RpcGateway,
         token_mint: str,
         token_amount_raw: int,
-        user_pubkey: str,
     ) -> tuple[bool, str, Optional[QuoteResult]]:
-        """Honeypot check: can we get a route AND simulate selling our exact holdings?
+        """Cheap honeypot proxy: does Jupiter QUOTE a sell-side route for our
+        exact holdings, for a positive SOL amount out?
 
-        Returns (sellable, detail, quote_or_none). Used by TokenSafety before
-        any buy -- if a token can't be sold now, at our size, it's worthless
-        to us regardless of chart appearance.
+        This replaced an earlier implementation that built a real sell swap
+        and ran `simulateTransaction` against it -- which sounds like a
+        stronger check but is actually broken by construction: simulating a
+        sell requires the wallet to already hold the tokens (a funded
+        associated token account for that mint), and we are evaluating this
+        BEFORE buying anything. Every single simulation failed with
+        `AccountNotFound`, honeypot or not, because the ATA never existed --
+        the old "honeypot" check could never pass on any token. Solana's
+        simulateTransaction has no account-state-override mechanism (unlike
+        an EVM fork) to fake holding the tokens, so a true pre-buy
+        simulation isn't feasible without infrastructure this bot doesn't
+        have (a local validator forked with a funded wallet).
+
+        A quote, by contrast, is a pure price lookup -- Jupiter computes it
+        from the pool's on-chain reserves and doesn't require the caller to
+        hold anything. It cannot catch every honeypot mechanism (a
+        Token-2022 transfer hook that reverts at transfer time never runs
+        during a quote -- see TokenSafety.check_honeypot for the
+        transferHook check layered on top of this), but it does catch the
+        common case: a pool with no sell-side liquidity/route at all.
         """
         try:
             quote = self.quote(token_mint, SOL_MINT, token_amount_raw, slippage_bps=500)
@@ -174,18 +190,7 @@ class JupiterClient:
         if quote.out_amount <= 0:
             return False, "sell route returns zero SOL out", quote
 
-        try:
-            built = self.build_swap_transaction(quote, user_pubkey)
-            sim = rpc.simulate_transaction(built["swapTransaction"], sig_verify=False)
-        except Exception as exc:  # noqa: BLE001 - any simulate failure means "can't confirm sellable"
-            return False, f"sell simulation failed: {exc}", quote
-
-        sim_value = sim.get("value", sim) if isinstance(sim, dict) else sim
-        err = sim_value.get("err") if isinstance(sim_value, dict) else None
-        if err is not None:
-            return False, f"sell simulation reverted: {err}", quote
-
-        return True, "sell simulated successfully", quote
+        return True, f"sell route exists (impact {quote.price_impact_pct:.2%})", quote
 
     def detect_transfer_tax_pct(
         self,
@@ -202,6 +207,13 @@ class JupiterClient:
         tax that the router didn't fully price in. Returns the tax
         fraction (0.0 if no meaningful gap detected or simulation lacks
         the data to tell).
+
+        NOT currently wired into TokenSafety.evaluate() and shares the same
+        pre-buy limitation check_sell_route's docstring explains for the
+        simulateTransaction approach it replaced: `simulateTransaction`
+        needs a funded token account to simulate a realistic sell, which we
+        don't have before buying. If this is ever wired up, expect it to
+        fail the same way the old honeypot check did.
         """
         quote = quote or self.quote(token_mint, SOL_MINT, token_amount_raw, slippage_bps=500)
         built = self.build_swap_transaction(quote, user_pubkey)

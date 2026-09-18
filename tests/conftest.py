@@ -112,7 +112,7 @@ class FakeJupiter:
         self.built_transactions.append(tx)
         return tx
 
-    def simulate_sell(self, rpc, token_mint, token_amount_raw, user_pubkey):
+    def check_sell_route(self, token_mint, token_amount_raw):
         quote = self.quote(token_mint, "SOL", token_amount_raw)
         return self.sellable, self.sell_detail, quote
 

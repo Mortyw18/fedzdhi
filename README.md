@@ -405,14 +405,123 @@ program could trip it within seconds of startup -- even against a
 perfectly healthy RPC endpoint -- just because notifications arrived
 faster than 3 consecutive failures could otherwise happen. Indexing is
 best-effort learning, not a trade waiting on a price, so its RPC failures
-now degrade locally (logged with the method name and error, then a short
-self-throttle after enough consecutive failures -- see
-`indexing_max_consecutive_rpc_failures` / `indexing_rpc_failure_cooldown_s`
-in `config.py`) and never touch the kill switch at all. The RPC-outage
-counter is fed exclusively by `TokenSafety`'s verdicts inside
-`evaluate_candidate` now -- the actual price-critical path a buy is gated
-on -- and only when a verdict's *failing* checks carry TokenSafety's own
-`"rpc error: "` detail prefix, never for an ordinary rejection.
+now degrade locally and never touch the kill switch at all -- see
+"Indexing's own backoff" below for exactly how. The RPC-outage counter is
+fed exclusively by `TokenSafety`'s verdicts inside `evaluate_candidate`
+now -- the actual price-critical path a buy is gated on -- and only when a
+verdict's *failing* checks carry TokenSafety's own `"rpc error: "` detail
+prefix, never for an ordinary rejection.
+
+### Indexing's own backoff, and why it isn't scoped to "just our candidates"
+
+A follow-up report showed `indexing_rpc_failure` logging several times a
+second with the fixed 30s cooldown above doing little to stop it. Two
+concrete fixes:
+
+- **A hard local rate cap** (`indexing_min_call_interval_s`, default 0.5s)
+  on the indexer's own `getTransaction` calls, independent of how fast
+  `logsSubscribe` notifications actually arrive. "Several notifications a
+  second" can no longer become "several RPC calls a second" from this loop
+  alone, even before any failure has happened to trigger backoff.
+- **Exponential, not flat, backoff** once `indexing_max_consecutive_rpc_failures`
+  is crossed (`indexing_rpc_failure_backoff_base_s` doubling each time the
+  threshold is crossed again without an intervening success, capped at
+  `indexing_rpc_failure_backoff_max_s`). A flat cooldown meant a genuinely
+  sustained outage got retried on a fixed schedule forever -- fail fast,
+  pause 30s, fail fast again the instant the pause ended.
+
+A third ask -- "index forward from new pool creations instead of broad
+program-wide scans" -- is *not* implemented, deliberately, and it's worth
+explaining why rather than silently skipping it. `logsSubscribe(mentions=
+[program_id])` really is a firehose (most swap activity network-wide on
+that AMM program, not just pools we care about), but InsiderRadar's actual
+purpose is building wallet-level conviction scores from a wallet's trading
+history across *many* tokens -- most of which we'd never discover as our
+own candidates (a wallet's edge is often entering tokens well before they'd
+pass SignalEngine's own liquidity/volume filters). Narrowing indexing to
+"only subscribe to mints we've discovered ourselves" would structurally
+break that: `conviction_min_distinct_tokens=15` could never be satisfied by
+a wallet if we only ever observed it trading inside our own candidate
+list. A real "index from pool creation" feature would need to detect pool
+*creation* instructions specifically (Raydium's `initialize2`, pump.fun's
+`create`, ...) by parsing program logs -- log formats that aren't
+officially documented and differ per DEX, where a subtly wrong parse fails
+silently (missed or mis-attributed events) rather than crashing loudly.
+That's real, valuable work, but it deserves its own pass against actual
+recorded transaction logs, not a guess shipped alongside four other fixes
+in the same sitting. The rate cap and exponential backoff above are the
+responsible way to keep the necessarily-broad subscription affordable in
+the meantime.
+
+### Two safety checks that could never actually pass, fixed
+
+A separate report showed every candidate rejecting with the identical two
+reasons -- `honeypot: sell simulation reverted: AccountNotFound` and
+`lp_burned_or_graduated: no LP mint known and token is not an un-graduated
+pump.fun token`. Both were structural, not calibration problems:
+
+- **`check_honeypot`** used to build a real sell transaction and
+  `simulateTransaction` it, which needs the wallet to already hold the
+  token (a funded associated token account) -- something that's never true
+  pre-buy. Every candidate failed with `AccountNotFound`, honeypot or not;
+  the check could not pass on ANY token. It's now a three-signal proxy
+  instead: a Jupiter sell-side route quote (a price lookup, doesn't
+  require holding anything), real observed sell volume in the last 5
+  minutes for DexScreener-sourced candidates (pump.fun's coin feed doesn't
+  expose this, so pump.fun-sourced candidates skip that specific signal),
+  and no active Token-2022 `transferHook` extension (the most common real
+  honeypot mechanism on current launches -- it can silently block a sell
+  that a quote alone would never catch, and costs zero extra RPC calls
+  since it reuses the mint account TokenSafety already fetched for the
+  mint/freeze-authority check). None of this proves a token is safe to
+  sell; it proves the cheapest signals a free RPC tier can afford didn't
+  fire.
+- **`check_lp_or_graduation`** rejected essentially every DexScreener-
+  sourced candidate, pump.fun-origin or not: `lp_mint` is never populated
+  by DexScreener discovery, and `Candidate.pump_fun_graduated` is only
+  ever set by SignalEngine's own pump.fun poller, never when the same
+  token is discovered via DexScreener's token-profiles/boosts. A mint
+  ending in pump.fun's vanity suffix (`"...pump"`) now gets its
+  bonding-curve/graduation state resolved directly from pump.fun's own API
+  instead. A lookup failure is treated as *unknown*, not a reject -- the
+  verdict cache (below) means the candidate gets a fresh attempt on a
+  later cycle rather than being permanently blocked by one bad request,
+  and pump.fun going down isn't something a bad-actor token can force on
+  demand to slip past this one check while every other check still
+  applies. Non-pump.fun DEX-native launches are unchanged and still fail
+  closed: resolving an arbitrary Raydium/Orca/Meteora pool's LP mint would
+  need per-DEX binary account-layout decoding this bot doesn't do.
+
+### Verdict cache: stop re-checking the same mint every cycle
+
+DexScreener rediscovers the same actively-trending mints every poll cycle
+by design -- without a cache, `evaluate_candidate` reran the full, RPC/
+Jupiter/rugcheck/pump.fun-lookup-costing safety pipeline on the same mint
+forever. `verdict_cache_ttl_s` (default 20 min) now short-circuits a
+rediscovery of a still-cached mint before any of that runs. Two things
+deliberately bypass the cache early: a big swing in the candidate's own
+reported liquidity (`verdict_cache_liquidity_change_pct`, default 20%,
+cheap since it's data SignalEngine already handed over) is treated as a
+state-change event, and a verdict whose rejection came from an RPC error
+(not a real pass/fail) is never cached at all -- caching "unknown because
+the RPC hiccuped" would suppress a retry for the full TTL exactly when a
+fresh attempt is most wanted, and would also mask a genuinely sustained
+outage from ever reaching `KillSwitch.set_rpc_outage`'s threshold.
+
+### A WebSocket 1011 can be self-inflicted
+
+A separate question worth a real answer rather than a guess: "is a 1011
+(server-side timeout) close code our own saturation, or Helius's?" It was
+ours. `SignalEngine._dispatch` used to call `Orchestrator._on_candidate`
+directly on the event loop -- and `evaluate_candidate` makes several
+blocking `requests` calls (RPC, Jupiter, rugcheck, pump.fun graduation).
+While one of those was running, the event loop couldn't service
+`RpcWebSocket`'s ping/pong keepalive or read the next `logsSubscribe`
+frame at all -- exactly the kind of client-side starvation that causes a
+server to eventually give up and close with 1011. `_dispatch` now runs a
+sync callback through the default executor instead, so candidate
+evaluation -- however slow -- can no longer be the thing that stalls the
+WebSocket.
 
 ---
 

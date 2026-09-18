@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from typing import Optional
 
 from nacl.signing import SigningKey
@@ -29,6 +30,7 @@ from bot.models import (
     CopySignal,
     Mode,
     Position,
+    SafetyVerdict,
     SignalSource,
     WalletBuyRecord,
     WalletSellRecord,
@@ -104,6 +106,7 @@ class Orchestrator:
             max_top10_holder_pct=config.max_top10_holder_pct,
             max_acceptable_price_impact_pct=config.max_acceptable_price_impact_pct,
             bundled_launch_min_distinct_tokens=config.bundled_launch_min_distinct_tokens,
+            enable_pumpfun_lookups=config.enable_pumpfun_source,
             logger=self.logger,
         )
         self.signal_engine = SignalEngine(
@@ -175,6 +178,11 @@ class Orchestrator:
         # failures -- see _index_program_loop and KillSwitch's module
         # docstring for why this must never call kill_switch.set_rpc_outage.
         self._indexing_rpc_consecutive_failures = 0
+        self._indexing_rpc_backoff_level = 0
+        self._indexing_last_call_at = 0.0
+        # mint -> (cached_at, liquidity_usd at that time, verdict). See
+        # _get_cached_verdict / evaluate_candidate.
+        self._verdict_cache: dict[str, tuple[float, float, SafetyVerdict]] = {}
         if config.helius_ws_url:
             self._ws = RpcWebSocket(config.helius_ws_url, logger=self.logger)
 
@@ -216,8 +224,49 @@ class Orchestrator:
     # the one path from candidate to position
     # ------------------------------------------------------------------
 
+    def _get_cached_verdict(self, candidate: Candidate) -> Optional[SafetyVerdict]:
+        """A cache hit means "skip the whole safety pipeline for this
+        rediscovery," not "reuse a stale verdict to act on" -- callers
+        return immediately on a hit rather than doing anything with the
+        verdict itself, since a cache hit exists purely to stop
+        re-evaluating the SAME mint every poll cycle. See
+        verdict_cache_ttl_s's docstring in config.py for why this exists:
+        DexScreener rediscovers the same actively-trending mints every
+        single cycle by design, so without this, evaluate_candidate's full
+        RPC/Jupiter/rugcheck/pump.fun pipeline reran on unchanged mints
+        forever.
+
+        Expired entries are evicted here rather than left to accumulate --
+        this cache has no separate cleanup pass.
+        """
+        cached = self._verdict_cache.get(candidate.mint)
+        if cached is None:
+            return None
+        cached_at, cached_liquidity, verdict = cached
+
+        if time.time() - cached_at >= self.config.verdict_cache_ttl_s:
+            del self._verdict_cache[candidate.mint]
+            return None
+
+        # A big liquidity swing is treated as a state-change event that
+        # invalidates the cache early, even inside the TTL -- cheap (data
+        # SignalEngine already gave us) and a reasonable proxy for "enough
+        # changed here that the old verdict might not hold," e.g. a rug
+        # pull draining the pool or a real pump attracting size.
+        if cached_liquidity > 0:
+            change = abs(candidate.liquidity_usd - cached_liquidity) / cached_liquidity
+            if change >= self.config.verdict_cache_liquidity_change_pct:
+                del self._verdict_cache[candidate.mint]
+                return None
+
+        return verdict
+
     def evaluate_candidate(self, candidate: Candidate) -> None:
         self.accounting.record_candidate(candidate)
+
+        if self._get_cached_verdict(candidate) is not None:
+            self.logger.debug("candidate skipped: cached verdict still fresh for %s", candidate.mint)
+            return
 
         # Observe-only (M2) skips the risk gate entirely: we want a safety
         # verdict logged for every candidate, not a subset filtered by
@@ -246,9 +295,22 @@ class Orchestrator:
         # _index_program_loop and KillSwitch's module docstring for the
         # incident that made this split necessary). See
         # _verdict_indicates_rpc_outage for exactly what counts.
-        newly_tripped = self.kill_switch.set_rpc_outage(self._verdict_indicates_rpc_outage(verdict))
+        rpc_outage_signal = self._verdict_indicates_rpc_outage(verdict)
+        newly_tripped = self.kill_switch.set_rpc_outage(rpc_outage_signal)
         if newly_tripped:
             self.alerter.notify_kill_switch(self.kill_switch.halt_reason())
+
+        if not rpc_outage_signal:
+            # An RPC-error verdict means "unknown," not a real pass/fail --
+            # caching it would suppress re-evaluating this mint for the
+            # full TTL exactly when a fresh attempt is most wanted (as soon
+            # as it's rediscovered, since the RPC may already have
+            # recovered by then). It also must never be allowed to mask a
+            # SUSTAINED outage: repeatedly rediscovering the same mint
+            # during a real outage should keep counting toward
+            # set_rpc_outage's threshold above, not get silently absorbed
+            # by the cache after the first attempt.
+            self._verdict_cache[candidate.mint] = (time.time(), candidate.liquidity_usd, verdict)
 
         if self.config.observe_only:
             # The entire point of M2: log the verdict, place no trade, live or paper.
@@ -382,6 +444,19 @@ class Orchestrator:
             signature = (notification.get("value") or {}).get("signature")
             if not signature:
                 continue
+
+            # Hard local rate cap on THIS loop's own getTransaction calls --
+            # independent of the RPC budget ceiling above, of how fast
+            # logsSubscribe notifications actually arrive, and of the
+            # exponential backoff below. A busy AMM program can fire several
+            # notifications a second; without this, that turns directly into
+            # several RPC calls a second from here alone, even before any
+            # failure has happened to trigger the backoff path.
+            elapsed = time.monotonic() - self._indexing_last_call_at
+            if elapsed < self.config.indexing_min_call_interval_s:
+                await asyncio.sleep(self.config.indexing_min_call_interval_s - elapsed)
+            self._indexing_last_call_at = time.monotonic()
+
             try:
                 tx = await asyncio.get_running_loop().run_in_executor(
                     None,
@@ -391,6 +466,7 @@ class Orchestrator:
                     ),
                 )
                 self._indexing_rpc_consecutive_failures = 0
+                self._indexing_rpc_backoff_level = 0
                 if tx:
                     self._parse_leader_activity(tx, signature)
             except RpcOutage as exc:
@@ -402,10 +478,10 @@ class Orchestrator:
                 # kill switch from exactly this loop within ~18s of startup
                 # -- a busy AMM program can fire many logsSubscribe
                 # notifications a second, each one a getTransaction call, so
-                # 3 consecutive failures happened here in seconds even
-                # though a plain curl to the same endpoint worked fine. The
-                # method + error are logged every time so a real outage is
-                # still fully diagnosable from the logs alone.
+                # a handful of consecutive failures happened here in seconds
+                # even though a plain curl to the same endpoint worked fine.
+                # The method + error are logged every time so a real outage
+                # is still fully diagnosable from the logs alone.
                 self._indexing_rpc_consecutive_failures += 1
                 self.logger.warning(
                     "indexing_rpc_failure",
@@ -419,18 +495,31 @@ class Orchestrator:
                     },
                 )
                 if self._indexing_rpc_consecutive_failures >= self.config.indexing_max_consecutive_rpc_failures:
+                    # Exponential, not flat: a flat cooldown meant a
+                    # genuinely sustained outage got retried on a fixed
+                    # schedule forever (fail fast, pause N seconds, fail
+                    # fast again the instant the pause ends, repeat) instead
+                    # of backing off further the longer it persists. Resets
+                    # to level 0 on the next success above.
+                    self._indexing_rpc_backoff_level += 1
+                    backoff = min(
+                        self.config.indexing_rpc_failure_backoff_base_s
+                        * (2 ** (self._indexing_rpc_backoff_level - 1)),
+                        self.config.indexing_rpc_failure_backoff_max_s,
+                    )
                     self.logger.warning(
                         "indexing_backing_off",
                         extra={
                             "fields": {
                                 "program_id": program_id,
-                                "cooldown_s": self.config.indexing_rpc_failure_cooldown_s,
+                                "backoff_s": backoff,
+                                "backoff_level": self._indexing_rpc_backoff_level,
                                 "consecutive_failures": self._indexing_rpc_consecutive_failures,
                             }
                         },
                     )
-                    await asyncio.sleep(self.config.indexing_rpc_failure_cooldown_s)
-                    self._indexing_rpc_consecutive_failures = 0  # self-heals: try again after the cooldown
+                    await asyncio.sleep(backoff)
+                    self._indexing_rpc_consecutive_failures = 0  # self-heals: try again after the backoff
 
     # ------------------------------------------------------------------
     # daily/weekly reporting
