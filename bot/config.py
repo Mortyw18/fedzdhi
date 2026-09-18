@@ -206,6 +206,22 @@ class Config:
     helius_ws_url: str = ""
     failover_rpc_url: str = ""
     rpc_rate_limit_per_10s: int = 100  # Helius free tier budget, conservative
+    # The maxSupportedTransactionVersion sent with every getTransaction
+    # call (indexing's and ExecutionEngine's own swap-confirmation fetch).
+    # Too low and the RPC provider rejects EVERY transaction using a newer
+    # format with JSON-RPC code -32015 ("Transaction version (N) is not
+    # supported..."), whose message text ("...not supported...") is
+    # otherwise indistinguishable from a plan-gating rejection -- that
+    # false read cost a production run its entire event-driven discovery
+    # funnel (getTransaction got 3-strike-disabled) before this was
+    # diagnosed. This is just the STARTING value: RpcGateway parses the
+    # actual required version out of any -32015 it sees and bumps its own
+    # live copy automatically for the rest of the run (see
+    # RpcGateway.max_supported_transaction_version /
+    # _post_with_auto_version_bump), so this only matters for how many
+    # (bounded, self-healing) failed requests a chain-wide version bump
+    # costs before the bot catches up on its own.
+    rpc_max_supported_transaction_version: int = 1
     # InsiderRadar's WebSocket indexing is the lowest-priority RPC consumer --
     # TokenSafety and ExitMonitor must never be starved by background
     # indexing. Once the gateway's own rolling budget usage crosses this

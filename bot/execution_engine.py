@@ -104,7 +104,14 @@ class LiveExecutionEngine:
                     raise ExecutionFailed(f"{side} tx {sig} did not confirm")
                 tx = self.rpc.call(
                     "getTransaction",
-                    [sig, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+                    # Read live off self.rpc -- see the matching comment on
+                    # Orchestrator's indexing call site. RpcGateway bumps
+                    # this in place on a -32015 "transaction version not
+                    # supported" response.
+                    [sig, {
+                        "encoding": "jsonParsed", "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": self.rpc.max_supported_transaction_version,
+                    }],
                 )
                 return sig, (tx or {})
             except Exception as exc:  # noqa: BLE001 - any failure here costs a fee and counts as an attempt

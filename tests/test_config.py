@@ -16,6 +16,14 @@ def test_default_max_buys_per_day_is_three():
     assert Config().max_buys_per_day == 3
 
 
+def test_default_rpc_max_supported_transaction_version_is_one():
+    """Was 0 (the original versioned-tx format); the chain had already
+    moved to version 1 by the time this was diagnosed in production, and a
+    cap of 0 made every getTransaction call for a newer tx fail with
+    JSON-RPC -32015, eventually 3-strike-disabling the method entirely."""
+    assert Config().rpc_max_supported_transaction_version == 1
+
+
 def test_position_over_hard_ceiling_rejected():
     with pytest.raises(ConfigError):
         Config(position_size_sol=0.5).validate()

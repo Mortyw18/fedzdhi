@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 import requests
 
-from bot.rpc_gateway import RateBudget, RpcGateway, RpcMethodDisabled, RpcOutage
+from bot.rpc_gateway import RateBudget, RpcError, RpcGateway, RpcMethodDisabled, RpcOutage
 
 
 def _ok_body(result="pong"):
@@ -403,6 +403,118 @@ def test_disabled_method_state_never_survives_a_new_gateway_instance(mock_sleep)
     fresh_gw = RpcGateway("http://primary.invalid", session=fresh_session, max_retries=1)
     assert fresh_gw.is_method_disabled("getProgramAccounts") is False
     assert fresh_gw.call("getProgramAccounts") == "value"
+
+
+# ----------------------------------------------------------------------
+# -32015 "transaction version not supported" auto-bump: root cause of the
+# same production silence above one layer down -- the free tier really
+# did support getTransaction fine, but maxSupportedTransactionVersion in
+# the request was lower than the chain's current transaction version, and
+# that error's message ("...not supported...") would otherwise be
+# misread by _looks_like_method_unavailable as a plan-gating rejection.
+# ----------------------------------------------------------------------
+
+
+def _version_error(required_version: int) -> dict:
+    return {
+        "code": -32015,
+        "message": (
+            f"Transaction version ({required_version}) is not supported by the requesting "
+            f'client. Please try the request again with the following configuration '
+            f'parameter: "maxSupportedTransactionVersion": {required_version}'
+        ),
+    }
+
+
+def test_a_single_version_error_never_disables_the_method():
+    """The exact misdiagnosis this fixes: -32015's message contains "not
+    supported," which _looks_like_method_unavailable would otherwise match
+    -- confirms it never even counts toward the disable-threshold streak."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(1)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    result = gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
+
+    assert result == "tx-data"
+    assert gw.is_method_disabled("getTransaction") is False
+
+
+def test_version_error_bumps_the_live_default_and_retries_in_place():
+    session = _ScriptedSession([("jsonrpc_error", _version_error(1)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    result = gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
+
+    assert result == "tx-data"
+    assert gw.max_supported_transaction_version == 1
+    # The retried request actually carried the bumped value, not the stale one.
+    assert session.script == []  # both scripted responses were consumed (one -32015, one ok)
+
+
+def test_version_error_patches_the_params_object_passed_by_the_caller():
+    """The caller's own params list is mutated in place, so a caller that
+    builds its config dict once and reuses the reference (as both
+    orchestrator.py and execution_engine.py effectively do by reading
+    rpc.max_supported_transaction_version fresh each call) sees the
+    corrected value reflected immediately."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(3)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+    config = {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+    params = ["sig1", config]
+
+    result = gw.call("getTransaction", params)
+
+    assert result == "tx-data"
+    assert config["maxSupportedTransactionVersion"] == 3  # mutated in place
+
+
+def test_version_error_bump_uses_the_parsed_required_version_not_a_blind_increment():
+    """A jump straight from 0 to 5 (not 0 -> 1 -> 2 -> ... -> 5) confirms
+    the required version is actually parsed out of the message, not just
+    incremented by one per failure."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(5)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
+
+    assert gw.max_supported_transaction_version == 5
+
+
+def test_version_error_bump_never_decreases_the_live_default():
+    """A malformed/unparseable message (defensive case) must still make
+    progress (avoid looping forever on the exact same request) rather than
+    parsing a version lower than what's already set."""
+    session = _ScriptedSession([("jsonrpc_error", {"code": -32015, "message": "not supported, no number here"}), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=4)
+
+    gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 4}])
+
+    assert gw.max_supported_transaction_version == 5  # conservative +1, never stuck or decreased
+
+
+def test_version_error_with_nothing_to_patch_surfaces_as_an_ordinary_error():
+    """A method that hits -32015 but whose params never even carried
+    maxSupportedTransactionVersion can't be fixed by bumping the instance
+    default -- must fail cleanly instead of retrying the identical request
+    forever."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(1))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    with pytest.raises(RpcError):
+        gw.call("someOtherMethod", ["sig1"])  # no config dict at all in params
+
+    assert gw.max_supported_transaction_version == 1  # still bumped -- just couldn't help THIS call
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_version_error_that_keeps_recurring_gives_up_after_a_bounded_number_of_bumps(mock_sleep):
+    """A provider that keeps demanding a higher version on every single
+    response (pathological/defensive case) must not spin forever."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(n)) for n in range(1, 20)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    with pytest.raises(RpcOutage):
+        gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
 
 
 # ----------------------------------------------------------------------

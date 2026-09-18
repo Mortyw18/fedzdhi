@@ -117,6 +117,7 @@ class Orchestrator:
             config.failover_rpc_url,
             rate_limit_per_10s=config.rpc_rate_limit_per_10s,
             on_budget_threshold=lambda pct: self.alerter.notify(f"RPC budget at {pct:.0%} of rate limit"),
+            max_supported_transaction_version=config.rpc_max_supported_transaction_version,
         )
         self.jupiter = JupiterClient(logger=self.logger)
         self.token_safety = TokenSafety(
@@ -635,7 +636,17 @@ class Orchestrator:
                     None,
                     lambda: self.rpc.call(
                         "getTransaction",
-                        [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+                        # Read live off self.rpc, not a hardcoded literal:
+                        # RpcGateway bumps this in place the moment it sees
+                        # a -32015 "transaction version not supported"
+                        # response, and every subsequent call (this one
+                        # included, on the next notification) should use
+                        # the corrected value from the start rather than
+                        # re-discovering it on every single call.
+                        [signature, {
+                            "encoding": "jsonParsed", "commitment": "confirmed",
+                            "maxSupportedTransactionVersion": self.rpc.max_supported_transaction_version,
+                        }],
                         # RpcGateway's own internal retry loop (default 3
                         # attempts, with sleeps between) would otherwise run
                         # on EVERY single call regardless of what indexing's

@@ -95,6 +95,24 @@ free-tier RPC budget, not just to survive an occasional spike:
   fundamental a method to treat any rejection of it as permanent, and
   indexing already has its own dedicated backoff for a genuine outage
   on that call.
+- **A getTransaction call for a transaction newer than
+  `rpc_max_supported_transaction_version` (default 1) fails with
+  JSON-RPC code -32015, whose message also contains "not supported" --**
+  handled entirely separately from the disable-detection above (it's
+  never a plan-gating rejection, always fixable by asking with a higher
+  version). `RpcGateway` parses the version the error says it needs
+  straight out of the message, bumps its own live
+  `max_supported_transaction_version` in place, patches it into the
+  in-flight request, and retries immediately -- so a chain-wide move to a
+  newer transaction format self-heals within one call() invocation, and
+  every call after that (both indexing's and ExecutionEngine's own swap
+  confirmation, which both read this value live off `self.rpc` rather
+  than a hardcoded literal) uses the corrected version from then on. Logs
+  `rpc_transaction_version_bumped` once per bump. This was the actual
+  root cause the very first time a production run's getTransaction got
+  3-strike-disabled: the free tier supported the method fine, but the cap
+  in the request was lower than the chain's actual transaction version at
+  the time.
 
 The RPC budget itself is audited, not just capped: `RpcGateway` tracks
 per-method call counts and calls-per-minute live, and the running bot

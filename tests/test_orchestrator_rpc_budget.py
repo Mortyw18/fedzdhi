@@ -48,6 +48,7 @@ class _AlwaysOutageRpc:
         self.params_log: list = []  # raw params per call, for asserting the exact outgoing request shape
         self.budget = _FakeBudget(usage_pct=0.0)
         self._disabled: set[str] = set()
+        self.max_supported_transaction_version = 1
 
     def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
@@ -67,6 +68,7 @@ class _AlwaysSucceedsRpc:
         self.call_count = 0
         self.budget = _FakeBudget(usage_pct=0.0)
         self._disabled: set[str] = set()
+        self.max_supported_transaction_version = 1
 
     def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
@@ -83,6 +85,7 @@ class _AlwaysMethodDisabledRpc:
     def __init__(self) -> None:
         self.call_count = 0
         self.budget = _FakeBudget(usage_pct=0.0)
+        self.max_supported_transaction_version = 1
 
     def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
@@ -238,18 +241,22 @@ def test_index_loop_calls_getTransaction_with_max_retries_one(tmp_path):
 
 def test_index_loop_getTransaction_always_requests_versioned_tx_support(tmp_path):
     """Regression coverage for a specific misdiagnosis: on a free RPC tier,
-    a versioned transaction fetched WITHOUT maxSupportedTransactionVersion
-    in the config object errors with a message that contains the substring
-    "not supported" -- which _looks_like_method_unavailable (rpc_gateway.py)
-    treats as "this method looks plan-gated," not as "this one request
-    needs one more config field." That misread would eventually accumulate
-    method_disable_threshold sustained rejections and permanently disable
-    getTransaction, exactly the symptom a silent pool_events funnel showed
-    in production. Confirms indexing's actual outgoing request config
-    always sets maxSupportedTransactionVersion=0 -- unconditionally, since
-    virtually all modern Solana transactions are versioned."""
+    a versioned transaction fetched with maxSupportedTransactionVersion set
+    too LOW for that transaction's actual version errors with JSON-RPC code
+    -32015 and a message containing the substring "not supported" -- which
+    _looks_like_method_unavailable (rpc_gateway.py) would otherwise treat
+    as "this method looks plan-gated" if that code weren't handled upstream
+    (see _TRANSACTION_VERSION_NOT_SUPPORTED_CODE), eventually accumulating
+    method_disable_threshold sustained rejections and permanently disabling
+    getTransaction -- exactly the symptom a silent pool_events funnel
+    showed in production, root-caused to Config.rpc_max_supported_transaction_version
+    (default 1) being too low for transactions the chain had moved past.
+    Confirms indexing's actual outgoing request reads the live value off
+    self.rpc rather than a hardcoded literal, so an auto-bump (see
+    RpcGateway._post_with_auto_version_bump) takes effect immediately."""
     orch = _build_orchestrator(tmp_path)
     orch.rpc = _AlwaysOutageRpc()
+    orch.rpc.max_supported_transaction_version = 1
     orch._ws = _FakeWs(_notifications(1))
 
     async def drive() -> None:
@@ -260,7 +267,28 @@ def test_index_loop_getTransaction_always_requests_versioned_tx_support(tmp_path
 
     assert len(orch.rpc.params_log) == 1
     signature, config = orch.rpc.params_log[0]
-    assert config["maxSupportedTransactionVersion"] == 0
+    assert config["maxSupportedTransactionVersion"] == 1
+
+
+def test_index_loop_picks_up_a_bumped_max_supported_transaction_version(tmp_path):
+    """If RpcGateway's live max_supported_transaction_version has already
+    been auto-bumped (e.g. by an earlier -32015 on a different call), the
+    NEXT indexing call must use the bumped value immediately, not the
+    original config default -- this is what makes the auto-bump actually
+    fix every subsequent call, not just retry the one that triggered it."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch.rpc.max_supported_transaction_version = 7  # simulates a prior auto-bump
+    orch._ws = _FakeWs(_notifications(1))
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    signature, config = orch.rpc.params_log[0]
+    assert config["maxSupportedTransactionVersion"] == 7
 
 
 def test_index_loop_never_lets_getTransaction_be_permanently_disabled(tmp_path):

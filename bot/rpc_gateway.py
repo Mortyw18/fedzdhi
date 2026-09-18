@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -70,6 +71,71 @@ class _MethodUnavailable(RpcError):
     the caller-visible RpcMethodDisabled. Never escapes _post/call."""
 
 
+# Solana's JSON-RPC error code for "this transaction's version is higher
+# than what maxSupportedTransactionVersion in the request allowed" -- e.g.
+# {"code": -32015, "message": "Transaction version (1) is not supported by
+# the requesting client. Please try the request again with the following
+# configuration parameter: \"maxSupportedTransactionVersion\": 1"}.
+# Checked and handled BEFORE _looks_like_method_unavailable below: that
+# message contains "not supported," which the plan-gating heuristic would
+# otherwise match, misreading "this one request needs a version bump" as
+# "this method looks permanently unavailable on this plan" -- exactly the
+# misdiagnosis that cost a production run its entire event-driven discovery
+# funnel (getTransaction 3-strike-disabled while the real cause was every
+# versioned transaction on-chain having moved past the hardcoded cap).
+_TRANSACTION_VERSION_NOT_SUPPORTED_CODE = -32015
+
+
+class _TransactionVersionTooLow(RpcError):
+    """Internal signal raised by _post when maxSupportedTransactionVersion
+    in the request was lower than the transaction's actual version --
+    never a permanent rejection, always fixable by resending with a higher
+    value. Caught inside call(), which bumps
+    RpcGateway.max_supported_transaction_version and retries the same
+    request in place. Never escapes _post/call."""
+
+    def __init__(self, required_version: int, message: str) -> None:
+        super().__init__(message)
+        self.required_version = required_version
+
+
+def _parse_required_transaction_version(message: str) -> Optional[int]:
+    """Pulls the version number Solana's -32015 error says the client
+    needs to request, straight out of the (freeform, provider-authored)
+    error message -- e.g. '...following configuration parameter:
+    "maxSupportedTransactionVersion": 1' or '...Transaction version (1) is
+    not supported...'. Returns None if the message doesn't match either
+    known shape, so the caller can fall back to a conservative +1 bump
+    rather than silently doing nothing.
+    """
+    match = re.search(r"maxSupportedTransactionVersion[\"']?\s*:\s*(\d+)", message)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"[Vv]ersion\s*\((\d+)\)", message)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _patch_max_supported_transaction_version(params: Optional[list], new_version: int) -> bool:
+    """Mutates any {"maxSupportedTransactionVersion": ...} entry inside a
+    JSON-RPC params list IN PLACE, so the exact payload dict already built
+    for this call is what actually gets resent -- the call site that built
+    `params` never needs to know a bump happened. Returns whether anything
+    was actually found and patched: a method whose call site never set
+    this key can't be helped by bumping it, and the caller uses this to
+    decide whether retrying is even worth attempting again.
+    """
+    if not params:
+        return False
+    patched = False
+    for element in params:
+        if isinstance(element, dict) and "maxSupportedTransactionVersion" in element:
+            element["maxSupportedTransactionVersion"] = new_version
+            patched = True
+    return patched
+
+
 def _looks_like_method_unavailable(error: Any) -> bool:
     """Heuristic over a JSON-RPC error object: does this look like "this
     method isn't available to you," not an ordinary transient failure?
@@ -83,6 +149,8 @@ def _looks_like_method_unavailable(error: Any) -> bool:
     if wasteful) retry-forever behavior for that one message shape. This
     is intentionally over-inclusive rather than exact, since the sustained
     threshold is what actually guards against acting on a one-off match.
+    Code -32015 (see _TRANSACTION_VERSION_NOT_SUPPORTED_CODE) is handled
+    entirely separately, upstream of this check, and must never reach here.
     """
     if not isinstance(error, dict):
         return False
@@ -149,6 +217,7 @@ class RpcGateway:
         rate_limit_base_backoff_s: float = 2.0,
         rate_limit_max_backoff_s: float = 60.0,
         logger: Optional[logging.Logger] = None,
+        max_supported_transaction_version: int = 1,
     ) -> None:
         self.primary_url = primary_url
         self.failover_url = failover_url
@@ -157,6 +226,18 @@ class RpcGateway:
         self.session = session or requests.Session()
         self.logger = logger or logging.getLogger("memebot.rpc_gateway")
         self._consecutive_failures = 0
+
+        # The highest Solana transaction version call sites that fetch
+        # transactions (indexing's getTransaction, ExecutionEngine's own
+        # swap confirmation) should ask for. Mutable and shared: call sites
+        # read this live (not a hardcoded literal) so an auto-bump below
+        # takes effect for every future call, not just the one that
+        # triggered it. Defaults to 1 -- version 0 was the original
+        # versioned-transaction format; version 1 (and whatever comes
+        # after) is handled the same way by _post_with_auto_version_bump
+        # the moment the chain moves again, without needing a code change.
+        self.max_supported_transaction_version = max_supported_transaction_version
+        self._max_version_autobumps = 5
 
         # Shared, gateway-wide backoff: a 429 anywhere sets a cooldown that
         # EVERY subsequent call (from any code path, any thread) checks and
@@ -258,9 +339,61 @@ class RpcGateway:
             raise _MethodUnavailable(f"403 Forbidden from {url}")
         resp.raise_for_status()
         data = resp.json()
-        if "error" in data and _looks_like_method_unavailable(data["error"]):
-            raise _MethodUnavailable(f"{payload['method']} RPC error: {data['error']}")
+        if "error" in data:
+            error = data["error"]
+            if isinstance(error, dict) and error.get("code") == _TRANSACTION_VERSION_NOT_SUPPORTED_CODE:
+                message = str(error.get("message", ""))
+                required = _parse_required_transaction_version(message)
+                if required is None:
+                    required = self.max_supported_transaction_version + 1
+                raise _TransactionVersionTooLow(required, message)
+            if _looks_like_method_unavailable(error):
+                raise _MethodUnavailable(f"{payload['method']} RPC error: {error}")
         return data
+
+    def _post_with_auto_version_bump(self, url: str, payload: dict, method: str) -> dict:
+        """Wraps _post so a -32015 "transaction version not supported"
+        response self-heals within this one call() attempt: bump
+        max_supported_transaction_version to whatever the error says the
+        client needs, patch it into this exact payload's params, and
+        re-issue the SAME request -- instead of surfacing it as an
+        ordinary failure that indexing's backoff or the disable-threshold
+        machinery (neither of which knows anything about transaction
+        versions) would otherwise have to absorb blindly, run after run,
+        forever, every time the chain's default version format changes.
+        Bounded so a provider that keeps demanding a higher version every
+        single response can't spin this forever.
+        """
+        for _ in range(self._max_version_autobumps + 1):
+            try:
+                return self._post(url, payload)
+            except _TransactionVersionTooLow as exc:
+                old = self.max_supported_transaction_version
+                new = max(old + 1, exc.required_version)
+                self.max_supported_transaction_version = new
+                patched = _patch_max_supported_transaction_version(payload.get("params"), new)
+                self.logger.warning(
+                    "rpc_transaction_version_bumped",
+                    extra={
+                        "fields": {
+                            "method": method, "old_version": old, "new_version": new,
+                            "params_patched": patched, "detail": str(exc),
+                        }
+                    },
+                )
+                self._record_call(method)
+                self.budget.record_and_check()
+                if not patched:
+                    # Nothing in this request's params names the key --
+                    # bumping the instance-wide default can't fix THIS
+                    # call, so don't loop pointlessly; let it surface as an
+                    # ordinary error instead.
+                    raise RpcError(f"{method}: transaction version {exc.required_version} not supported, "
+                                    f"and no maxSupportedTransactionVersion param present to patch: {exc}") from exc
+        raise RpcOutage(
+            f"{method}: transaction version requirement kept increasing past "
+            f"{self._max_version_autobumps} auto-bumps -- giving up on this call"
+        )
 
     def _trip_rate_limit_cooldown(self, method: str, exc: Exception) -> None:
         self._rate_limit_backoff_level += 1
@@ -328,7 +461,7 @@ class RpcGateway:
                 self._record_call(method)
                 self.budget.record_and_check()
                 try:
-                    data = self._post(url, payload)
+                    data = self._post_with_auto_version_bump(url, payload, method)
                     if "error" in data:
                         raise RpcError(f"{method} RPC error: {data['error']}")
                     self._consecutive_failures = 0
