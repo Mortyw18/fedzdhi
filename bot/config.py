@@ -89,6 +89,11 @@ class Config:
     # poll interval is a real lever on RPC load, not just DexScreener's own
     # rate limit. 60s is the top of the spec's 30-60s range.
     dexscreener_poll_interval_s: float = 60.0
+    # /search's relevance ranking essentially never surfaces a pool young
+    # enough to pass max_pool_age_s -- token-profiles/token-boosts (see
+    # signal_engine.py) are the primary discovery path now; these queries
+    # are only a supplementary trend signal layered on top of that.
+    dexscreener_search_queries: list[str] = field(default_factory=lambda: ["SOL", "pump", "bonk", "meme"])
     min_pool_liquidity_usd: float = 15_000.0
     max_pool_liquidity_usd: float = 400_000.0
     max_pool_age_s: float = 72 * 3600.0
@@ -132,6 +137,15 @@ class Config:
     # ceiling, the indexer stops issuing getTransaction calls for new
     # notifications until usage drops back down (see Orchestrator).
     indexing_max_rpc_budget_pct: float = 0.50
+    # Indexing's own RPC failures (getTransaction on a logsSubscribe
+    # notification) must degrade gracefully and never touch the kill switch
+    # -- that's reserved for TokenSafety's price-critical checks (see
+    # KillSwitch's module docstring). Instead, after this many consecutive
+    # getTransaction failures the indexer pauses itself for
+    # indexing_rpc_failure_cooldown_s before trying again, so a real outage
+    # self-throttles instead of hammering the endpoint on every notification.
+    indexing_max_consecutive_rpc_failures: int = 5
+    indexing_rpc_failure_cooldown_s: float = 30.0
     # How often the running bot snapshots RpcGateway's call stats into
     # Accounting, so `--daily-report` can show the RPC budget after the
     # fact even though that one-shot command never starts a live gateway.

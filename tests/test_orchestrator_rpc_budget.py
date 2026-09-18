@@ -1,11 +1,17 @@
 """Orchestrator: the indexing pipeline must be the first thing to back off
 when RPC budget is tight (it's background learning, not a trade waiting on
-a price), and repeated RpcOutage failures from that pipeline must alert
-the operator ONCE, not on every dropped notification.
+a price). Its own RpcOutage failures must degrade gracefully (log + a
+local self-throttle) and must NEVER touch the kill switch -- an overnight
+run tripped the kill switch from this exact loop within ~18s of startup
+while a plain curl to the same endpoint worked fine. The kill switch's
+RPC-outage counter is now fed exclusively by TokenSafety's verdicts in
+evaluate_candidate (see test_evaluate_candidate_rpc_outage.py), the
+price-critical path a buy is actually gated on.
 """
 from __future__ import annotations
 
 import asyncio
+from unittest import mock
 
 from bot.config import Config
 from bot.models import Mode
@@ -100,7 +106,7 @@ def test_indexing_not_skipped_below_its_ceiling_even_if_nonzero(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_index_loop_alerts_once_despite_many_failing_notifications(tmp_path):
+def test_index_loop_never_touches_kill_switch_on_sustained_rpc_outage(tmp_path):
     orch = _build_orchestrator(tmp_path)
     orch.rpc = _AlwaysOutageRpc()
     orch._ws = _FakeWs(_notifications(20))
@@ -110,19 +116,73 @@ def test_index_loop_alerts_once_despite_many_failing_notifications(tmp_path):
 
     async def drive() -> None:
         orch.stop_event = asyncio.Event()
-        await orch._index_program_loop("SomeProgram")
+        with mock.patch("bot.orchestrator.asyncio.sleep", new=mock.AsyncMock()):
+            await orch._index_program_loop("SomeProgram")
 
     asyncio.run(drive())
 
-    # It takes max_consecutive_rpc_outages (default 3) real failing attempts
-    # before the kill switch actually halts -- a single blip must never trip
-    # it (see KillSwitch's module docstring for the incident this prevents).
-    # Once it does halt, every remaining notification is skipped by
-    # _indexing_skip_reason() before ever reaching rpc.call again -- so
-    # exactly 3 calls are attempted (not 20), and exactly one alert is ever
-    # sent, on the call that actually crossed the threshold.
-    assert orch.rpc.call_count == orch.kill_switch.max_consecutive_rpc_outages == 3
-    assert len(alerts) == 1
+    # Every single notification is attempted (no skip kicks in, since the
+    # kill switch never halts and the fake budget stays at 0) -- indexing's
+    # own RPC failures degrade locally and never alert or halt anything.
+    assert orch.rpc.call_count == 20
+    assert orch.kill_switch.is_halted() is False
+    assert alerts == []
+
+
+def test_index_loop_logs_method_and_error_on_each_rpc_failure(tmp_path):
+    import logging
+
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch._ws = _FakeWs(_notifications(1))
+
+    # memebot's logger has propagate=False (see logging_setup.py), so a
+    # plain handler attached directly to it is the reliable way to capture
+    # records in a test -- caplog's root-logger handler never sees them.
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    orch.logger.addHandler(handler)
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        with mock.patch("bot.orchestrator.asyncio.sleep", new=mock.AsyncMock()):
+            await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    failure_records = [r for r in records if r.getMessage() == "indexing_rpc_failure"]
+    assert len(failure_records) == 1
+    fields = failure_records[0].fields
+    assert fields["method"] == "getTransaction"
+    assert "simulated outage" in fields["error"]
+
+
+def test_index_loop_backs_off_after_threshold_then_self_heals(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    orch.config.indexing_max_consecutive_rpc_failures = 3
+    orch.rpc = _AlwaysOutageRpc()
+    orch._ws = _FakeWs(_notifications(6))  # exactly two full thresholds' worth
+
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        with mock.patch("bot.orchestrator.asyncio.sleep", new=_fake_sleep):
+            await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    # Every notification is still attempted (degrading gracefully means
+    # pausing between bursts, not giving up) -- but every 3rd consecutive
+    # failure triggers one cooldown sleep and resets the counter, so a
+    # sustained outage self-throttles instead of hammering the endpoint.
+    assert orch.rpc.call_count == 6
+    assert sleep_calls == [orch.config.indexing_rpc_failure_cooldown_s] * 2
+    assert orch._indexing_rpc_consecutive_failures == 0
 
 
 def test_index_loop_skips_all_notifications_when_budget_is_tight(tmp_path):

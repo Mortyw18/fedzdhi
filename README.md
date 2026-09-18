@@ -358,19 +358,35 @@ flips to live mode on its own.
 
 An overnight run once logged 0 signals, 0 safety checks, and 0 RPC calls
 for 10 hours straight -- and nothing in the logs distinguished that from
-"a genuinely quiet, healthy night." The root cause was `SignalEngine`'s
-default DexScreener query (`"solana"`): DexScreener's `/search` endpoint
-is a keyword text search over token name/symbol/address, not a chain
-filter, and the literal word "solana" almost never appears in a pair's
-name or symbol -- so the `chainId=="solana"` filter had nothing to keep,
-every single poll. The default is now `"SOL"` (the actual quote-token
-symbol on nearly every Solana memecoin pair), but the real fix is that
-this class of failure is no longer silent:
+"a genuinely quiet, healthy night." Two bugs in a row turned out to be
+hiding behind that silence, both in how DexScreener discovery worked:
+
+1. `SignalEngine`'s default query (`"solana"`) was fed to DexScreener's
+   `/search` endpoint, which is a keyword text search over token
+   name/symbol/address, not a chain filter -- the literal word "solana"
+   almost never appears in a pair's name or symbol, so the
+   `chainId=="solana"` filter had nothing to keep, every single poll.
+2. Fixing the query to `"SOL"` surfaced a second, deeper problem: `/search`
+   ranks by relevance and trading history, so it reliably returns pairs
+   that are already established -- it essentially never ranks a pool young
+   enough to pass the `pool_age` freshness filter. The funnel log made
+   this one visible immediately: `"solana_pairs": 15` every cycle,
+   `"passed_filters": 0`, 100% rejected by `pool_age`.
+
+Discovery is now three DexScreener sources, not a single search query:
+`token-profiles/latest/v1` and `token-boosts/latest/v1` (which list by
+recency/promotion, so a pool minutes old actually shows up) are the
+primary path, resolved to real pairs via `tokens/{addresses}`; `/search`
+is kept as a supplementary trend signal run over several configured
+query terms (`dexscreener_search_queries`), not one hardcoded string. But
+the real fix, both times, is that this class of failure is no longer silent:
 
 - Every DexScreener poll ends with one INFO-level `dexscreener_poll_summary`
-  log: raw pairs returned, how many were even on-chain (`solana_pairs`),
-  and a rejection-reason breakdown for the rest. If `solana_pairs` is
-  consistently 0 or 1, the query itself is the thing to change, not the
+  log: how many profiles/boosts came back and were on-chain, how many
+  tokens got resolved to pairs, search results per query, and a
+  rejection-reason breakdown for everything that didn't pass. If
+  `solana_pairs` is consistently 0 (or `passed_filters` stays 0 while
+  `rejected_by.pool_age` climbs), that's the thing to change, not the
   liquidity/volume thresholds.
 - Every `heartbeat_interval_s` (default 10min) there's one INFO-level
   `heartbeat` log: poll counts per source, RPC calls/minute and budget
@@ -381,6 +397,22 @@ this class of failure is no longer silent:
   (wallets indexed, tokens tracked, buy/sell events seen) -- previously
   this state existed only in the running process's memory and the daily
   report had no visibility into it at all.
+
+A related, separately-diagnosed issue: the RPC-outage kill switch used to
+be fed by InsiderRadar's background on-chain indexing (`getTransaction`
+lookups off `logsSubscribe` notifications), which meant a busy AMM
+program could trip it within seconds of startup -- even against a
+perfectly healthy RPC endpoint -- just because notifications arrived
+faster than 3 consecutive failures could otherwise happen. Indexing is
+best-effort learning, not a trade waiting on a price, so its RPC failures
+now degrade locally (logged with the method name and error, then a short
+self-throttle after enough consecutive failures -- see
+`indexing_max_consecutive_rpc_failures` / `indexing_rpc_failure_cooldown_s`
+in `config.py`) and never touch the kill switch at all. The RPC-outage
+counter is fed exclusively by `TokenSafety`'s verdicts inside
+`evaluate_candidate` now -- the actual price-critical path a buy is gated
+on -- and only when a verdict's *failing* checks carry TokenSafety's own
+`"rpc error: "` detail prefix, never for an ordinary rejection.
 
 ---
 

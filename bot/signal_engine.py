@@ -2,7 +2,9 @@
 
 Two sources, budget-aware polling:
   - DexScreener: liquidity/volume/velocity screening on Raydium/Orca/Meteora
-    pairs that have already established some trading history.
+    pairs. Discovery itself is now THREE DexScreener endpoints, not one --
+    see poll_dexscreener_once's docstring for why /search alone silently
+    starved the bot of every real signal.
   - pump.fun: brand-new bonding-curve launches, before they'd even show up
     on DexScreener. pump.fun's public API is unofficial and can change
     without notice -- every call here is wrapped so a schema change or
@@ -24,8 +26,17 @@ import requests
 from bot.models import Candidate, SignalSource
 
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
-DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/{mints}"
+# Newest token listings and currently-boosted (paid-promotion) tokens across
+# every chain DexScreener indexes -- unlike /search (a keyword text match),
+# these two actually surface freshly launched / currently-trending pools.
+# Neither carries pool/liquidity data itself; DEXSCREENER_TOKENS_URL resolves
+# the addresses they return to real pairs.
+DEXSCREENER_TOKEN_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEXSCREENER_TOKEN_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
 PUMPFUN_NEW_COINS_URL = "https://frontend-api.pump.fun/coins"
+
+DEFAULT_DEXSCREENER_SEARCH_QUERIES = ("SOL", "pump", "bonk", "meme")
 
 CandidateCallback = Callable[[Candidate], Union[None, Awaitable[None]]]
 
@@ -41,18 +52,19 @@ class SignalEngine:
         dexscreener_poll_interval_s: float = 45.0,
         pumpfun_poll_interval_s: float = 20.0,
         pumpfun_max_consecutive_failures: int = 5,
-        # DexScreener's /search endpoint is a keyword text search over
-        # token name/symbol/address, NOT a chain filter -- it does not mean
-        # "give me pairs on this chain." An overnight run with
-        # dexscreener_query="solana" logged 0 signals for 10 hours because
-        # the literal word "solana" almost never appears in a pair's name
-        # or symbol, so the chainId=="solana" filter below had nothing to
-        # keep. "SOL" works because it's the actual quote-token symbol on
-        # nearly every Solana memecoin pair -- see poll_dexscreener_once's
-        # funnel log (raw_pairs vs solana_pairs) if this default ever stops
-        # working; DexScreener's search ranking/limits aren't documented
-        # and can change without notice.
-        dexscreener_query: str = "SOL",
+        # /search is a keyword text search over token name/symbol/address,
+        # NOT a chain filter, and -- the second bug found after fixing the
+        # first -- it also only really indexes pairs that already have
+        # trading history and relevance ranking behind them. An overnight
+        # run querying "SOL" logged "solana_pairs": 15 every cycle but
+        # "passed_filters": 0, 100% rejected by pool_age -- every single
+        # result /search returned was already older than the 72h freshness
+        # window. A brand-new pool essentially never ranks in a text search
+        # yet. /search is kept here as a supplementary trend signal (several
+        # queries, not one), but token-profiles/token-boosts below are now
+        # the primary discovery path specifically because they list pools
+        # by recency/promotion, not by search relevance.
+        dexscreener_search_queries: Optional[list[str]] = None,
         enable_pumpfun_source: bool = True,
         session: Optional[requests.Session] = None,
         logger: Optional[logging.Logger] = None,
@@ -65,7 +77,9 @@ class SignalEngine:
         self.dexscreener_poll_interval_s = dexscreener_poll_interval_s
         self.pumpfun_poll_interval_s = pumpfun_poll_interval_s
         self.pumpfun_max_consecutive_failures = pumpfun_max_consecutive_failures
-        self.dexscreener_query = dexscreener_query
+        self.dexscreener_search_queries: list[str] = (
+            list(dexscreener_search_queries) if dexscreener_search_queries else list(DEFAULT_DEXSCREENER_SEARCH_QUERIES)
+        )
         self.session = session or requests.Session()
         self.logger = logger or logging.getLogger("memebot.signal_engine")
         self._seen_mints: set[str] = set()
@@ -96,15 +110,48 @@ class SignalEngine:
     # DexScreener
     # ------------------------------------------------------------------
 
-    def fetch_dexscreener_pairs(self) -> list[dict]:
-        """Raw search results, every chain DexScreener's text match returned --
-        NOT pre-filtered to Solana. poll_dexscreener_once does that filtering
-        itself so it can log how many raw results even were on-chain before
-        any threshold is applied; see the funnel log for why that split
-        matters."""
-        resp = self.session.get(
-            DEXSCREENER_SEARCH_URL, params={"q": self.dexscreener_query}, timeout=10.0
-        )
+    def fetch_dexscreener_token_profiles(self) -> list[dict]:
+        """The newest token listings DexScreener knows about, across every
+        chain it indexes -- this is the actual "what just launched" feed;
+        /search's relevance ranking essentially never surfaces a pool this
+        young (see poll_dexscreener_once). Each item carries chainId +
+        tokenAddress but no pool/liquidity data of its own."""
+        resp = self.session.get(DEXSCREENER_TOKEN_PROFILES_URL, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    def fetch_dexscreener_token_boosts(self) -> list[dict]:
+        """Tokens currently paying for DexScreener's boost/promotion --
+        a cheap "trending right now" signal, independent of how new the
+        pool is. Same shape as token-profiles (chainId + tokenAddress,
+        no pool data)."""
+        resp = self.session.get(DEXSCREENER_TOKEN_BOOSTS_URL, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    def fetch_dexscreener_pairs_for_tokens(self, mints: list[str]) -> list[dict]:
+        """Resolve token-profile/token-boost addresses to their actual
+        trading pairs (liquidity, volume, age) -- up to 30 addresses per
+        request, chunked."""
+        out: list[dict] = []
+        for i in range(0, len(mints), 30):
+            chunk = mints[i:i + 30]
+            resp = self.session.get(DEXSCREENER_TOKENS_URL.format(mints=",".join(chunk)), timeout=10.0)
+            resp.raise_for_status()
+            data = resp.json()
+            out.extend(data.get("pairs") or [])
+        return out
+
+    def fetch_dexscreener_search_pairs(self, query: str) -> list[dict]:
+        """Keyword text search -- a supplementary trend signal (several
+        queries, see dexscreener_search_queries), not the primary discovery
+        path. /search ranks by relevance/volume, so it reliably returns
+        pairs that already have trading history; it is NOT how brand-new
+        pools get found (see poll_dexscreener_once's docstring for the
+        incident that established this)."""
+        resp = self.session.get(DEXSCREENER_SEARCH_URL, params={"q": query}, timeout=10.0)
         resp.raise_for_status()
         data = resp.json()
         return data.get("pairs") or []
@@ -160,7 +207,7 @@ class SignalEngine:
     def fetch_candidate_by_mint(self, mint: str) -> Optional[Candidate]:
         """Fresh single-token lookup, used for pricing an insider copy-trade signal."""
         try:
-            resp = self.session.get(DEXSCREENER_TOKENS_URL.format(mint=mint), timeout=10.0)
+            resp = self.session.get(DEXSCREENER_TOKENS_URL.format(mints=mint), timeout=10.0)
             resp.raise_for_status()
             data = resp.json()
         except (requests.RequestException, ValueError) as exc:
@@ -172,25 +219,67 @@ class SignalEngine:
         best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0))
         return self.parse_dexscreener_pair(best)
 
-    def poll_dexscreener_once(self) -> list[Candidate]:
-        """Every cycle ends with one INFO-level funnel log
-        (raw pairs -> on-chain pairs -> parseable -> pass/fail per
-        threshold bucket), specifically so "0 candidates" is diagnosable
-        from the logs alone instead of looking identical to "everything's
-        fine, just quiet" -- that gap is exactly what let a bad search
-        query run for 10 hours unnoticed."""
-        self.dexscreener_polls_done += 1
+    def _fetch_source(self, label: str, errors: dict[str, str], fn, *args) -> list:
+        """Run one DexScreener source fetch; on failure, record it in
+        `errors` and return [] instead of raising -- one dead endpoint
+        (say, token-boosts having an outage) must never take down the
+        other sources in the same poll cycle."""
         try:
-            raw_pairs = self.fetch_dexscreener_pairs()
+            return fn(*args)
         except (requests.RequestException, ValueError) as exc:
-            self.logger.info(
-                "dexscreener_poll_summary",
-                extra={"fields": {"query": self.dexscreener_query, "error": str(exc), "raw_pairs": 0, "solana_pairs": 0, "passed_filters": 0}},
-            )
-            self.logger.warning("dexscreener poll failed: %s", exc)
+            errors[label] = str(exc)
             return []
 
-        solana_pairs = [p for p in raw_pairs if p.get("chainId") == "solana"]
+    def poll_dexscreener_once(self) -> list[Candidate]:
+        """Discovery is three DexScreener sources, not one:
+
+          1. token-profiles/latest + token-boosts/latest -- the newest and
+             currently-trending listings, resolved to real pairs via the
+             tokens/{addresses} endpoint. This is the PRIMARY discovery
+             path: it lists by recency/promotion, so a pool minutes old
+             actually shows up here.
+          2. /search, run over several configured query terms -- a
+             supplementary trend signal. /search ranks by relevance and
+             essentially never returns a pool young enough to pass the
+             pool_age filter (an overnight run confirmed this: 15
+             solana_pairs every cycle, 0 passed_filters, 100% rejected by
+             pool_age -- every result was already stale by the time
+             /search surfaced it).
+
+        Every cycle still ends with one INFO-level funnel log (raw pairs ->
+        on-chain pairs -> parseable -> pass/fail per threshold bucket), so
+        "0 candidates" stays diagnosable from the logs alone -- the gap
+        that let a bad discovery strategy run for 10 hours unnoticed."""
+        self.dexscreener_polls_done += 1
+        errors: dict[str, str] = {}
+
+        profiles = self._fetch_source("profiles", errors, self.fetch_dexscreener_token_profiles)
+        boosts = self._fetch_source("boosts", errors, self.fetch_dexscreener_token_boosts)
+        profile_mints = {p.get("tokenAddress") for p in profiles if p.get("chainId") == "solana" and p.get("tokenAddress")}
+        boost_mints = {b.get("tokenAddress") for b in boosts if b.get("chainId") == "solana" and b.get("tokenAddress")}
+        new_token_mints = sorted(profile_mints | boost_mints)
+
+        resolved_pairs = (
+            self._fetch_source("resolve", errors, self.fetch_dexscreener_pairs_for_tokens, new_token_mints)
+            if new_token_mints
+            else []
+        )
+
+        search_pairs: list[dict] = []
+        for query in self.dexscreener_search_queries:
+            search_pairs.extend(self._fetch_source(f"search:{query}", errors, self.fetch_dexscreener_search_pairs, query))
+
+        # Dedupe across all three sources by pair address (falling back to
+        # the base mint) -- the same pool can easily show up via both a
+        # boosted-token resolve AND a search hit.
+        solana_pairs_by_key: dict[str, dict] = {}
+        for raw in resolved_pairs + search_pairs:
+            if raw.get("chainId") != "solana":
+                continue
+            key = raw.get("pairAddress") or (raw.get("baseToken") or {}).get("address")
+            if key:
+                solana_pairs_by_key[key] = raw
+        solana_pairs = list(solana_pairs_by_key.values())
 
         out: list[Candidate] = []
         unparseable = 0
@@ -212,15 +301,25 @@ class SignalEngine:
             "dexscreener_poll_summary",
             extra={
                 "fields": {
-                    "query": self.dexscreener_query,
-                    "raw_pairs": len(raw_pairs),
+                    "queries": list(self.dexscreener_search_queries),
+                    "profiles_seen": len(profiles),
+                    "profiles_solana": len(profile_mints),
+                    "boosts_seen": len(boosts),
+                    "boosts_solana": len(boost_mints),
+                    "resolved_tokens": len(new_token_mints),
+                    "resolved_pairs": len(resolved_pairs),
+                    "search_pairs": len(search_pairs),
+                    "raw_pairs": len(resolved_pairs) + len(search_pairs),
                     "solana_pairs": len(solana_pairs),
                     "unparseable": unparseable,
                     "passed_filters": len(out),
                     "rejected_by": dict(rejection_buckets),
+                    **({"errors": errors} if errors else {}),
                 }
             },
         )
+        if errors:
+            self.logger.warning("dexscreener poll had %d source failure(s) this cycle: %s", len(errors), errors)
         return out
 
     # ------------------------------------------------------------------

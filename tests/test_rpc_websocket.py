@@ -71,6 +71,34 @@ def test_active_connections_increments_while_connected_and_decrements_after():
     asyncio.run(drive())
 
 
+def test_reconnect_resumes_yielding_notifications_after_drop():
+    """Confirms subscribe() doesn't silently die or get stuck on a drop --
+    after reconnecting, the SAME generator (the one InsiderRadar's
+    `async for` loop is iterating) keeps yielding live notifications. What
+    is genuinely, permanently lost is whatever the chain emitted during the
+    gap itself -- logsSubscribe has no replay/cursor to recover that -- but
+    the subscription as a whole must not go silent forever after one blip."""
+    drop_exc = websockets.exceptions.ConnectionClosedError(None, None)
+    conn1 = _FakeConnection(messages=[], fail_after=drop_exc)  # dies right after ack, before any notification
+    conn2 = _FakeConnection(messages=[{"params": {"result": {"value": {"signature": "after-reconnect"}}}}])
+    ws = RpcWebSocket("wss://example.invalid")
+
+    async def drive():
+        with mock.patch(
+            "bot.rpc_gateway.websockets.connect",
+            side_effect=[_FakeConnectCM(conn1), _FakeConnectCM(conn2)],
+        ), mock.patch("bot.rpc_gateway.asyncio.sleep", new=mock.AsyncMock()):
+            agen = ws.subscribe("logsSubscribe", [{"mentions": ["X"]}], max_reconnects=5)
+            got = await agen.__anext__()
+            assert got == {"value": {"signature": "after-reconnect"}}
+            await agen.aclose()
+
+    asyncio.run(drive())
+
+    stats = ws.get_ws_stats()
+    assert stats["total_reconnects"] == 1  # exactly the one drop, before the post-reconnect notification arrived
+
+
 def test_reconnect_counted_and_stats_updated_on_drop():
     drop_exc = websockets.exceptions.ConnectionClosedError(None, None)
     conn = _FakeConnection(messages=[], fail_after=drop_exc)
