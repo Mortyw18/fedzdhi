@@ -136,7 +136,7 @@ why 0.05 SOL is the hard default and 0.1 SOL requires both
 | Alerter | `bot/alerter.py` | Telegram notifications, `/status` and `/stop` |
 | KillSwitch | `bot/kill_switch.py` | Daily loss cap, consecutive-failure cap, RPC-outage halt, manual reset only |
 | Orchestrator | `bot/orchestrator.py` | Wires everything into one asyncio process |
-| CLI | `bot/cli.py`, `run.py` | Entry point, confirmations, `--observe-only`, `--sweep`, `--daily-report`, `--reset-kill-switch` |
+| CLI | `bot/cli.py`, `run.py` | Entry point, confirmations, `--observe-only`, `--sweep`, `--daily-report`, `--radar-stats`, `--reset-kill-switch` |
 
 There is exactly one path from "candidate token" to "open position":
 `Orchestrator.evaluate_candidate` -> `TokenSafety.evaluate` ->
@@ -290,6 +290,7 @@ you'd actually get).
 python run.py                                  # paper mode, 0.05 SOL positions
 caffeinate python run.py                       # macOS: prevents sleep from silently disabling stops
 python run.py --daily-report                   # print today's report and exit
+python run.py --radar-stats                    # print InsiderRadar's latest indexing snapshot and exit
 python run.py --reset-kill-switch              # manually clear a tripped kill switch
 python run.py --sweep --sweep-to <address>     # drain the live wallet (requires typed confirmation)
 ```
@@ -352,6 +353,34 @@ flips to live mode on its own.
   picture, including how `TokenSafety` and `InsiderRadar`'s indexing
   keep their own RPC usage bounded, and how `--daily-report` surfaces
   calls-per-minute and peak budget usage after the fact.
+
+### Diagnosing a quiet run
+
+An overnight run once logged 0 signals, 0 safety checks, and 0 RPC calls
+for 10 hours straight -- and nothing in the logs distinguished that from
+"a genuinely quiet, healthy night." The root cause was `SignalEngine`'s
+default DexScreener query (`"solana"`): DexScreener's `/search` endpoint
+is a keyword text search over token name/symbol/address, not a chain
+filter, and the literal word "solana" almost never appears in a pair's
+name or symbol -- so the `chainId=="solana"` filter had nothing to keep,
+every single poll. The default is now `"SOL"` (the actual quote-token
+symbol on nearly every Solana memecoin pair), but the real fix is that
+this class of failure is no longer silent:
+
+- Every DexScreener poll ends with one INFO-level `dexscreener_poll_summary`
+  log: raw pairs returned, how many were even on-chain (`solana_pairs`),
+  and a rejection-reason breakdown for the rest. If `solana_pairs` is
+  consistently 0 or 1, the query itself is the thing to change, not the
+  liquidity/volume thresholds.
+- Every `heartbeat_interval_s` (default 10min) there's one INFO-level
+  `heartbeat` log: poll counts per source, RPC calls/minute and budget
+  usage, WebSocket active-connection and reconnect counts, and whether
+  the kill switch is halted. Silence between heartbeats now means "still
+  running," not "might have died three hours ago."
+- `python run.py --radar-stats` shows InsiderRadar's last snapshot
+  (wallets indexed, tokens tracked, buy/sell events seen) -- previously
+  this state existed only in the running process's memory and the daily
+  report had no visibility into it at all.
 
 ---
 

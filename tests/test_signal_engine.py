@@ -37,7 +37,7 @@ class _FlakySession:
         self.succeeds_after = succeeds_after
         self.call_count = 0
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, headers=None, timeout=None):
         self.call_count += 1
         if self.succeeds_after is not None and self.call_count > self.succeeds_after:
             return _FakeResponse(200, payload=[])
@@ -118,3 +118,72 @@ def test_dexscreener_unaffected_by_pumpfun_outage():
     engine.session = _DexSession()
     result = engine.poll_dexscreener_once()
     assert result == []  # no candidates, but crucially: no exception
+
+
+def test_enable_pumpfun_source_false_skips_entirely_no_network():
+    class _ExplodingSession:
+        def get(self, *args, **kwargs):
+            raise AssertionError("pump.fun must not be called when the source is disabled via config")
+
+    engine = SignalEngine(
+        min_pool_liquidity_usd=15_000, max_pool_liquidity_usd=400_000, max_pool_age_s=72 * 3600,
+        min_volume_liquidity_ratio=0.20, min_buy_sell_ratio=1.5,
+        enable_pumpfun_source=False, session=_ExplodingSession(),
+    )
+    assert engine.pumpfun_disabled is True
+    assert engine.poll_pumpfun_once() == []
+
+
+def test_pumpfun_request_sends_browser_like_headers():
+    captured = {}
+
+    class _CapturingSession:
+        def get(self, url, params=None, headers=None, timeout=None):
+            captured["headers"] = headers
+            return _FakeResponse(200, payload=[])
+
+    engine = _engine(_CapturingSession())
+    engine.poll_pumpfun_once()
+
+    assert captured["headers"] is not None
+    assert "User-Agent" in captured["headers"]
+    assert "python-requests" not in captured["headers"]["User-Agent"]
+
+
+def test_poll_counters_increment_for_the_heartbeat_log():
+    """These are what the heartbeat log reports as polls_done -- "0" must
+    mean something different from "1200" even when both produced zero
+    candidates."""
+    session = _FlakySession(status_code=530)  # pump.fun always fails, still counts as a poll
+    engine = _engine(session)
+    assert engine.dexscreener_polls_done == 0
+    assert engine.pumpfun_polls_done == 0
+
+    engine.poll_pumpfun_once()
+    engine.poll_pumpfun_once()
+    assert engine.pumpfun_polls_done == 2
+
+    class _DexSession:
+        def get(self, url, params=None, timeout=None):
+            return _FakeResponse(200, payload={"pairs": []})
+
+    engine.session = _DexSession()
+    engine.poll_dexscreener_once()
+    engine.poll_dexscreener_once()
+    engine.poll_dexscreener_once()
+    assert engine.dexscreener_polls_done == 3
+
+
+def test_pumpfun_poll_counter_frozen_once_disabled():
+    """Once the circuit breaker disables the source, further poll calls
+    are no-ops and must not keep incrementing polls_done -- a frozen
+    counter in the heartbeat is itself the signal that it's disabled."""
+    engine = _engine(_FlakySession(status_code=530), max_failures=2)
+    engine.poll_pumpfun_once()
+    engine.poll_pumpfun_once()
+    assert engine.pumpfun_disabled is True
+    frozen_at = engine.pumpfun_polls_done
+
+    engine.poll_pumpfun_once()
+    engine.poll_pumpfun_once()
+    assert engine.pumpfun_polls_done == frozen_at

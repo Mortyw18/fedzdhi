@@ -74,6 +74,14 @@ class InsiderRadar:
         self._trailing_pnl: dict[str, deque[float]] = {}
         self._blocklist: set[str] = set()
 
+        # Raw event counters, purely for the operator-facing stats snapshot
+        # (get_stats() / --radar-stats) -- distinct from any of the scoring
+        # state above, which is why they live separately rather than being
+        # derived from len(_wallet_stats) etc: those only count wallets that
+        # produced a BUY, while these count every event actually observed.
+        self.total_buy_events = 0
+        self.total_sell_events = 0
+
     # ------------------------------------------------------------------
     # a. indexing
     # ------------------------------------------------------------------
@@ -82,6 +90,7 @@ class InsiderRadar:
         self._pool_creation_slot[mint] = slot
 
     def record_buy(self, record: WalletBuyRecord, wallet_first_seen_ts: Optional[float] = None) -> None:
+        self.total_buy_events += 1
         bucket = self._first_buyers.setdefault(record.mint, [])
         if len(bucket) < self.first_buyers_n:
             bucket.append(record)
@@ -121,6 +130,7 @@ class InsiderRadar:
     # ------------------------------------------------------------------
 
     def record_sell(self, record: WalletSellRecord) -> None:
+        self.total_sell_events += 1
         lots = self._open_lots.get((record.wallet, record.mint))
         stats = self._wallet_stats.setdefault(record.wallet, LeaderStats(wallet=record.wallet, first_seen=record.timestamp))
 
@@ -255,3 +265,21 @@ class InsiderRadar:
     def watch_list(self) -> set[str]:
         """Wallets worth subscribing to for real-time buy detection."""
         return set(self._wallet_stats.keys()) - self._blocklist
+
+    # ------------------------------------------------------------------
+    # f. operator-facing stats (all in-memory -- see Orchestrator's periodic
+    # snapshot into Accounting, which is what makes this readable from a
+    # one-shot CLI command after the fact)
+    # ------------------------------------------------------------------
+
+    def get_stats(self) -> dict:
+        return {
+            "wallets_indexed": len(self._wallet_stats),
+            "tokens_tracked": len(self._first_buyers),
+            "total_buy_events": self.total_buy_events,
+            "total_sell_events": self.total_sell_events,
+            "sniper_count": len(self.sniper_leaderboard()),
+            "conviction_count": len(self.conviction_leaderboard()),
+            "unfollowed_count": len(self._blocklist),
+            "watch_list_size": len(self.watch_list()),
+        }

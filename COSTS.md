@@ -63,6 +63,34 @@ that's the signal to either raise `dexscreener_poll_interval_s`, lower
 `indexing_max_rpc_budget_pct` further, or move to a paid RPC tier --
 not to loosen the budget tracker's own limit.
 
+### A day of "RPC budget: 0.0" is not automatically a bug
+
+`RpcGateway`'s budget tracker only counts calls that actually go through
+`RpcGateway.call()` -- and only two things in this codebase ever do
+that: `TokenSafety`'s checks (mint/holder/LP/honeypot) and InsiderRadar's
+indexing loop's `getTransaction` lookups. Two entire, load-bearing parts
+of the pipeline never touch it at all, by design:
+
+- **DexScreener polling** uses `SignalEngine`'s own `requests.Session`,
+  talking directly to `api.dexscreener.com` -- not Helius, not
+  `RpcGateway`, at any point.
+- **WebSocket indexing** (`RpcWebSocket`) opens its own raw
+  `websockets.connect()` to Helius's WS endpoint and does its own
+  JSON-RPC framing over that socket. It never calls `RpcGateway.call()`
+  either, so `logsSubscribe` traffic doesn't touch the HTTP budget
+  tracker regardless of how many notifications arrive.
+
+So if `TokenSafety.evaluate()` was never invoked (no candidate ever
+passed SignalEngine's filters) and the indexing loop never got as far as
+a successful `getTransaction` (e.g. it was skipped by the kill-switch
+guard, or budget-priority backoff, the whole run), the RPC budget
+snapshot legitimately reads all zeroes for the entire period -- not
+because tracking broke, but because nothing that counts against it ever
+ran. Check `--radar-stats` and the `dexscreener_poll_summary` /
+`heartbeat` log lines before assuming a flat RPC budget line means the
+tracker itself is broken; it usually means the funnel upstream of it is
+empty.
+
 ## Per-trade fee estimate
 
 | Component | Estimate | Notes |

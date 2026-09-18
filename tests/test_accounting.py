@@ -133,3 +133,24 @@ def test_rpc_budget_absent_produces_no_false_warning():
     report = acc.daily_report()
     assert report["rpc_budget"]["snapshots"] == 0
     assert not any("RPC budget" in w for w in report["warnings"])
+
+
+def test_latest_radar_snapshot_round_trips():
+    acc = _acc()
+    assert acc.latest_radar_snapshot() is None  # nothing recorded yet
+
+    acc.record_radar_snapshot(
+        {"wallets_indexed": 5, "tokens_tracked": 20, "total_buy_events": 40, "total_sell_events": 10,
+         "sniper_count": 2, "conviction_count": 0, "unfollowed_count": 0, "watch_list_size": 5},
+        timestamp=time.time(),
+    )
+    acc.record_radar_snapshot(
+        {"wallets_indexed": 8, "tokens_tracked": 25, "total_buy_events": 55, "total_sell_events": 15,
+         "sniper_count": 2, "conviction_count": 1, "unfollowed_count": 0, "watch_list_size": 8},
+        timestamp=time.time() + 60,
+    )
+
+    snapshot = acc.latest_radar_snapshot()
+    assert snapshot is not None
+    assert snapshot["wallets_indexed"] == 8  # the most recent one, not the first
+    assert snapshot["conviction_count"] == 1

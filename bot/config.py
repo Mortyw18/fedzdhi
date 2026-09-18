@@ -68,6 +68,13 @@ class Config:
     time_stop_min_gain_pct: float = 0.10      # +10%
     daily_loss_cap_sol: float = 0.04
     max_position_fraction_of_bankroll: float = 0.50  # refuse configs above this
+    # Failed txs cost fees -- a streak this long in a row means something is
+    # structurally wrong, not bad luck.
+    max_consecutive_execution_failures: int = 3
+    # A single blip (cold-start DNS/TLS, one transient timeout) must never
+    # trip the kill switch on its own -- only a sustained outage should.
+    # See KillSwitch's module docstring for the incident that set this.
+    max_consecutive_rpc_outages: int = 3
 
     # --- slippage doctrine ---
     slippage_impact_multiplier: float = 2.0
@@ -91,6 +98,10 @@ class Config:
     # Cloudflare 530s). After this many consecutive poll failures, SignalEngine
     # stops polling it for the rest of the run rather than retrying forever.
     pumpfun_max_consecutive_failures: int = 5
+    # Manual override: set False to skip pump.fun entirely (e.g. it's been
+    # 530ing for days and you're tired of the circuit breaker re-trying it
+    # every restart). DexScreener signals and InsiderRadar are unaffected.
+    enable_pumpfun_source: bool = True
 
     # --- insider radar ---
     insider_first_buyers_n: int = 50
@@ -125,6 +136,12 @@ class Config:
     # Accounting, so `--daily-report` can show the RPC budget after the
     # fact even though that one-shot command never starts a live gateway.
     rpc_budget_snapshot_interval_s: float = 60.0
+    # INFO-level proof-of-life log: poll counts, RPC usage, WS status.
+    # Exists so an unattended overnight run's silence is either "confirmed
+    # quiet and healthy" or "clearly stalled," never ambiguous -- an
+    # earlier run went 10 hours with zero of anything and looked, from the
+    # logs alone, indistinguishable from a healthy quiet night.
+    heartbeat_interval_s: float = 600.0
 
     # --- telegram ---
     telegram_bot_token: str = ""
@@ -308,6 +325,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sweep", action="store_true", help="Drain the wallet to a destination address and exit.")
     p.add_argument("--sweep-to", default=None, help="Destination address for --sweep.")
     p.add_argument("--daily-report", action="store_true", help="Print today's report and exit.")
+    p.add_argument(
+        "--radar-stats", action="store_true",
+        help="Print the latest InsiderRadar snapshot (wallets indexed, tokens tracked, events seen) and exit.",
+    )
     return p
 
 

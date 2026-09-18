@@ -74,7 +74,8 @@ def test_indexing_not_skipped_when_healthy(tmp_path):
 
 def test_indexing_skipped_when_kill_switch_halted(tmp_path):
     orch = _build_orchestrator(tmp_path)
-    orch.kill_switch.set_rpc_outage(True)
+    for _ in range(orch.kill_switch.max_consecutive_rpc_outages):
+        orch.kill_switch.set_rpc_outage(True)  # sustained -- see KillSwitch's own tests for the single-blip case
     reason = orch._indexing_skip_reason()
     assert reason is not None
     assert "kill switch halted" in reason
@@ -113,11 +114,14 @@ def test_index_loop_alerts_once_despite_many_failing_notifications(tmp_path):
 
     asyncio.run(drive())
 
-    # After the very first RpcOutage, the kill switch is halted, and every
-    # notification after that is skipped by _indexing_skip_reason() before
-    # ever reaching rpc.call again -- so only one call is attempted, and
-    # only one alert is ever sent, despite 20 notifications arriving.
-    assert orch.rpc.call_count == 1
+    # It takes max_consecutive_rpc_outages (default 3) real failing attempts
+    # before the kill switch actually halts -- a single blip must never trip
+    # it (see KillSwitch's module docstring for the incident this prevents).
+    # Once it does halt, every remaining notification is skipped by
+    # _indexing_skip_reason() before ever reaching rpc.call again -- so
+    # exactly 3 calls are attempted (not 20), and exactly one alert is ever
+    # sent, on the call that actually crossed the threshold.
+    assert orch.rpc.call_count == orch.kill_switch.max_consecutive_rpc_outages == 3
     assert len(alerts) == 1
 
 

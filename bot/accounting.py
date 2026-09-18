@@ -84,6 +84,23 @@ CREATE TABLE IF NOT EXISTS rpc_budget_snapshots (
     total_calls INTEGER,
     top_methods_json TEXT
 );
+
+-- Periodic snapshots of InsiderRadar.get_stats(). InsiderRadar's own state
+-- (wallet scores, leaderboards) lives entirely in memory in the running
+-- process -- this table is the ONLY way a one-shot CLI command (which
+-- never constructs an InsiderRadar) can show indexing activity at all.
+CREATE TABLE IF NOT EXISTS radar_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL,
+    wallets_indexed INTEGER,
+    tokens_tracked INTEGER,
+    total_buy_events INTEGER,
+    total_sell_events INTEGER,
+    sniper_count INTEGER,
+    conviction_count INTEGER,
+    unfollowed_count INTEGER,
+    watch_list_size INTEGER
+);
 """
 
 
@@ -208,6 +225,27 @@ class Accounting:
         )
         self.conn.commit()
 
+    def record_radar_snapshot(self, stats: dict, timestamp: Optional[float] = None) -> None:
+        """`stats` is InsiderRadar.get_stats()'s output."""
+        self.conn.execute(
+            """INSERT INTO radar_snapshots
+               (timestamp, wallets_indexed, tokens_tracked, total_buy_events, total_sell_events,
+                sniper_count, conviction_count, unfollowed_count, watch_list_size)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                timestamp if timestamp is not None else now_ts(),
+                stats.get("wallets_indexed", 0),
+                stats.get("tokens_tracked", 0),
+                stats.get("total_buy_events", 0),
+                stats.get("total_sell_events", 0),
+                stats.get("sniper_count", 0),
+                stats.get("conviction_count", 0),
+                stats.get("unfollowed_count", 0),
+                stats.get("watch_list_size", 0),
+            ),
+        )
+        self.conn.commit()
+
     # ------------------------------------------------------------------
     # reads / reporting
     # ------------------------------------------------------------------
@@ -219,6 +257,14 @@ class Accounting:
                GROUP BY leader_wallet ORDER BY pnl_sol DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def latest_radar_snapshot(self) -> Optional[dict]:
+        """The single most recent InsiderRadar snapshot, regardless of what
+        day it landed on -- unlike daily_report, this is "current state,"
+        not "today's activity," since indexing progress spans days by
+        design (see the cold-start discussion in HONESTY.md)."""
+        row = self.conn.execute("SELECT * FROM radar_snapshots ORDER BY timestamp DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
 
     def daily_report(self, date_str: Optional[str] = None) -> dict:
         date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")

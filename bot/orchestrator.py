@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 from typing import Optional
 
 from nacl.signing import SigningKey
@@ -66,10 +67,29 @@ class Orchestrator:
 
         self.accounting = Accounting(config.db_path, logger=self.logger)
         self.kill_switch = KillSwitch(
-            config.daily_loss_cap_sol, state_path=config.kill_switch_state_path, logger=self.logger
+            config.daily_loss_cap_sol,
+            max_consecutive_failures=config.max_consecutive_execution_failures,
+            max_consecutive_rpc_outages=config.max_consecutive_rpc_outages,
+            state_path=config.kill_switch_state_path,
+            logger=self.logger,
         )
         self.risk_manager = RiskManager(config, self.kill_switch, logger=self.logger)
         self.alerter = Alerter(config.telegram_bot_token, config.telegram_chat_id, logger=self.logger)
+
+        # The kill switch persisting across restarts is deliberate (see its
+        # module docstring) -- but it must never be silent about it. A
+        # crash-loop or an operator who forgot it was halted both need this
+        # to be impossible to miss, not a line buried in DEBUG output.
+        if self.kill_switch.is_halted():
+            reason = self.kill_switch.halt_reason()
+            self.logger.error(
+                "startup_kill_switch_already_halted",
+                extra={"fields": {"reason": reason, "state_path": config.kill_switch_state_path}},
+            )
+            self.alerter.notify(
+                f"STARTUP: kill switch is ALREADY HALTED from a previous run ({reason}). "
+                "No buys will happen until you run `python run.py --reset-kill-switch`."
+            )
 
         self.rpc = RpcGateway(
             config.helius_rpc_url,
@@ -94,6 +114,7 @@ class Orchestrator:
             min_buy_sell_ratio=config.min_buy_sell_ratio,
             dexscreener_poll_interval_s=config.dexscreener_poll_interval_s,
             pumpfun_max_consecutive_failures=config.pumpfun_max_consecutive_failures,
+            enable_pumpfun_source=config.enable_pumpfun_source,
             logger=self.logger,
         )
         self.insider_radar = InsiderRadar(
@@ -338,6 +359,7 @@ class Orchestrator:
                         [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
                     ),
                 )
+                self.kill_switch.set_rpc_outage(False)  # a successful round-trip resets the sustained-failure streak
                 if tx:
                     self._parse_leader_activity(tx, signature)
             except RpcOutage:
@@ -357,10 +379,12 @@ class Orchestrator:
             self.alerter.notify_rejection_digest(report)
 
     async def _rpc_budget_snapshot_loop(self) -> None:
-        """Persists RpcGateway's live call stats periodically so the RPC
-        budget audit shows up in `--daily-report` even though that one-shot
-        command never starts a real gateway -- it only ever reads this
-        history back out of SQLite."""
+        """Persists RpcGateway's live call stats AND InsiderRadar's live
+        indexing stats periodically, so both show up in `--daily-report` /
+        `--radar-stats` even though those one-shot commands never start a
+        real gateway or radar -- they only ever read this history back out
+        of SQLite. Same loop, same interval: neither is expensive enough
+        to warrant its own timer."""
         while not self.stop_event.is_set():
             await asyncio.sleep(self.config.rpc_budget_snapshot_interval_s)
             stats = self.rpc.get_call_stats()
@@ -368,6 +392,38 @@ class Orchestrator:
             self.logger.debug(
                 "rpc_budget_snapshot",
                 extra={"fields": {**stats, "indexing_skipped": self._indexing_skipped_count}},
+            )
+            radar_stats = self.insider_radar.get_stats()
+            self.accounting.record_radar_snapshot(radar_stats)
+            self.logger.debug("radar_snapshot", extra={"fields": radar_stats})
+
+    async def _heartbeat_loop(self) -> None:
+        """One INFO-level line every heartbeat_interval_s (default 10min),
+        unconditionally -- unlike the DEBUG-level snapshot logs above, this
+        is meant to be visible in a normal console/log-tail without
+        cranking verbosity, specifically so an operator (or a `tail -f` at
+        3am) can tell "quiet and healthy" from "silently stalled" without
+        waiting for the next daily report."""
+        while not self.stop_event.is_set():
+            await asyncio.sleep(self.config.heartbeat_interval_s)
+            rpc_stats = self.rpc.get_call_stats()
+            ws_stats = self._ws.get_ws_stats() if self._ws is not None else {"active_connections": 0, "total_reconnects": 0, "last_drop_at": None}
+            self.logger.info(
+                "heartbeat",
+                extra={
+                    "fields": {
+                        "dexscreener_polls_done": self.signal_engine.dexscreener_polls_done,
+                        "pumpfun_polls_done": self.signal_engine.pumpfun_polls_done,
+                        "pumpfun_disabled": self.signal_engine.pumpfun_disabled,
+                        "rpc_calls_per_minute": rpc_stats["calls_per_minute"],
+                        "rpc_budget_usage_pct": rpc_stats["budget_usage_pct"],
+                        "rpc_total_calls": rpc_stats["total_calls"],
+                        "ws_active_connections": ws_stats["active_connections"],
+                        "ws_total_reconnects": ws_stats["total_reconnects"],
+                        "kill_switch_halted": self.kill_switch.is_halted(),
+                        "open_positions": len(self.open_positions),
+                    }
+                },
             )
 
     def status_text(self) -> str:
@@ -395,6 +451,28 @@ class Orchestrator:
         # declaration in __init__).
         self.stop_event = asyncio.Event()
 
+        # Ctrl+C's default behavior is to raise KeyboardInterrupt wherever
+        # the event loop happens to be -- typically inside the
+        # `await self.stop_event.wait()` below -- which skips straight past
+        # the cancel-and-gather cleanup at the bottom of this function
+        # entirely. asyncio.run() then tears down the loop with tasks still
+        # pending, which is what prints "Task was destroyed but it is
+        # pending" spam. Catching SIGINT/SIGTERM here instead lets us set
+        # stop_event cleanly, so the normal shutdown path always runs.
+        # Unix-only (SIGTERM/signal handlers aren't supported on Windows);
+        # cli.py's `except KeyboardInterrupt` is the fallback there.
+        loop = asyncio.get_running_loop()
+
+        def _handle_shutdown_signal(sig: signal.Signals) -> None:
+            self.logger.info("shutdown_signal_received", extra={"fields": {"signal": sig.name}})
+            self.stop_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
+            except NotImplementedError:
+                pass  # Windows -- KeyboardInterrupt fallback in cli.py still applies
+
         mode_label = "observe-only" if self.config.observe_only else self.config.mode.value
         self.logger.info("orchestrator_start", extra={"fields": {"mode": mode_label}})
         self.alerter.notify(f"memebot starting in {mode_label} mode")
@@ -404,6 +482,7 @@ class Orchestrator:
             asyncio.create_task(self.signal_engine.run_pumpfun_loop(self._on_candidate, self.stop_event)),
             asyncio.create_task(self._daily_report_loop()),
             asyncio.create_task(self._rpc_budget_snapshot_loop()),
+            asyncio.create_task(self._heartbeat_loop()),
             asyncio.create_task(self.alerter.run_command_loop(self.status_text, self._request_stop, self.stop_event)),
         ]
         if not self.config.observe_only:

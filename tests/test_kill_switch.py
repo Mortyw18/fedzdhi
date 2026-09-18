@@ -35,11 +35,34 @@ def test_success_resets_failure_streak(tmp_path):
     assert ks.is_halted() is False  # streak was reset, only at 2 again
 
 
-def test_rpc_outage_halts(tmp_path):
-    ks = _ks(tmp_path)
+def test_rpc_outage_halts_only_after_sustained_failures(tmp_path):
+    """A single blip must never trip this -- see KillSwitch's module
+    docstring for the false-positive this threshold exists to prevent."""
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=3)
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False
     ks.set_rpc_outage(True)
     assert ks.is_halted() is True
     assert "RPC outage" in ks.halt_reason()
+    assert "3 consecutive" in ks.halt_reason()
+
+
+def test_single_rpc_outage_never_trips_on_its_own(tmp_path):
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=3)
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False
+
+
+def test_rpc_success_resets_the_outage_streak(tmp_path):
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=3)
+    ks.set_rpc_outage(True)
+    ks.set_rpc_outage(True)
+    ks.set_rpc_outage(False)  # a success in between -- streak resets
+    ks.set_rpc_outage(True)
+    ks.set_rpc_outage(True)
+    assert ks.is_halted() is False  # only 2 consecutive since the reset, not 4
 
 
 def test_manual_reset_required(tmp_path):
@@ -102,7 +125,10 @@ def test_record_execution_failure_returns_true_only_on_first_trip(tmp_path):
 
 
 def test_set_rpc_outage_returns_true_only_on_first_trip(tmp_path):
-    ks = _ks(tmp_path)
+    # max_consecutive_rpc_outages=1 isolates the latch behavior under test
+    # here from the sustained-failure threshold, which has its own tests
+    # above -- this test is purely "once halted, stop reporting new trips."
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=1)
     assert ks.set_rpc_outage(True) is True
     # A flood of repeated RpcOutage exceptions (e.g. one per WebSocket
     # notification, arriving every few seconds) must each report "not a
@@ -115,7 +141,7 @@ def test_set_rpc_outage_returns_true_only_on_first_trip(tmp_path):
 def test_reset_then_new_trip_reports_true_again(tmp_path):
     """A reset is a real state change back to 'not halted', so the NEXT
     trip afterward is genuinely new and must alert again."""
-    ks = _ks(tmp_path)
+    ks = _ks(tmp_path, max_consecutive_rpc_outages=1)
     assert ks.set_rpc_outage(True) is True
     assert ks.set_rpc_outage(True) is False
     ks.reset()

@@ -303,6 +303,21 @@ class RpcWebSocket:
     def __init__(self, ws_url: str, logger: Optional[logging.Logger] = None) -> None:
         self.ws_url = ws_url
         self.logger = logger or logging.getLogger("memebot.rpc_ws")
+        # Aggregate across every concurrent subscribe() call this instance
+        # is running (Orchestrator subscribes multiple program IDs off one
+        # RpcWebSocket) -- not per-subscription precision, but exactly the
+        # granularity the heartbeat log needs: "is anything connected right
+        # now, and how flaky has it been."
+        self.active_connections = 0
+        self.total_reconnects = 0
+        self.last_drop_at: Optional[float] = None
+
+    def get_ws_stats(self) -> dict:
+        return {
+            "active_connections": self.active_connections,
+            "total_reconnects": self.total_reconnects,
+            "last_drop_at": self.last_drop_at,
+        }
 
     async def subscribe(
         self, method: str, params: list, max_reconnects: int = 1_000_000
@@ -318,12 +333,18 @@ class RpcWebSocket:
                     if "error" in ack:
                         raise RpcError(f"subscribe {method} failed: {ack['error']}")
                     attempt = 0  # reset backoff after a clean connect
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        if "params" in msg and "result" in msg["params"]:
-                            yield msg["params"]["result"]
+                    self.active_connections += 1
+                    try:
+                        async for raw in ws:
+                            msg = json.loads(raw)
+                            if "params" in msg and "result" in msg["params"]:
+                                yield msg["params"]["result"]
+                    finally:
+                        self.active_connections -= 1
             except (websockets.exceptions.WebSocketException, OSError, RpcError) as exc:
                 attempt += 1
+                self.total_reconnects += 1
+                self.last_drop_at = time.time()
                 delay = min(2 ** attempt, 30)
                 self.logger.warning("ws subscribe %s dropped (%s), reconnecting in %ss", method, exc, delay)
                 await asyncio.sleep(delay)
