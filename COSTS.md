@@ -78,14 +78,23 @@ free-tier RPC budget, not just to survive an occasional spike:
   costing up to ~1.5s of extra retry time per failure regardless of what
   indexing's own backoff was doing.
 - **A method RpcGateway detects as permanently rejected (403, or a
-  JSON-RPC error that reads like "not available on this plan") is
-  disabled for the rest of the run.** Every subsequent call to it fails
-  instantly, with zero network I/O -- this matters most for a Helius free
-  tier, where some enhanced/paid-tier-only methods return exactly this
-  shape of error, and retrying one forever on every single call would
-  otherwise burn budget and time for no possible benefit. `rpc_method_disabled`
-  logs once when this happens; `disabled_methods` in `get_call_stats()` /
-  `--daily-report` shows what's currently off.
+  JSON-RPC error that reads like "not available on this plan"), 3
+  separate times, is disabled for the rest of the run.** Every subsequent
+  call to it fails instantly, with zero network I/O -- this matters most
+  for a Helius free tier, where some enhanced/paid-tier-only methods
+  return exactly this shape of error, and retrying one forever on every
+  single call would otherwise burn budget and time for no possible
+  benefit. `rpc_method_disabled` logs once when this happens (with the
+  exact outgoing `params` that triggered it, for diagnosing a
+  misclassification without needing to reproduce the call by hand);
+  `disabled_methods` in `get_call_stats()` / `--daily-report` shows what's
+  currently off. This state is process memory only, never written to
+  disk -- a restart always starts with every method enabled, nothing to
+  clear manually. Indexing's own `getTransaction` call is exempt from
+  ever being disabled at all (`allow_method_disable=False`): it's too
+  fundamental a method to treat any rejection of it as permanent, and
+  indexing already has its own dedicated backoff for a genuine outage
+  on that call.
 
 The RPC budget itself is audited, not just capped: `RpcGateway` tracks
 per-method call counts and calls-per-minute live, and the running bot

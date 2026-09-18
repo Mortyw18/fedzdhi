@@ -193,6 +193,12 @@ class RpcGateway:
         # is actually disabled; short of that, it's treated as an ordinary
         # transient failure (RpcOutage as usual) and the count keeps
         # accumulating across calls.
+        #
+        # Deliberately NOT persisted to disk anywhere (unlike KillSwitch's
+        # state -- see kill_switch.py): this is a fresh, empty set every
+        # time a RpcGateway is constructed, and Orchestrator constructs a
+        # brand new one on every process start. A disabled-for-this-run
+        # method never survives a restart; there is no state file to clear.
         self._disabled_methods: set[str] = set()
         self._method_unavailable_counts: Counter[str] = Counter()
         self.method_disable_threshold = 3
@@ -336,7 +342,7 @@ class RpcGateway:
                     if not allow_method_disable:
                         self.logger.warning(
                             "rpc_method_rejection_ignored",
-                            extra={"fields": {"method": method, "detail": str(exc)}},
+                            extra={"fields": {"method": method, "params": params, "detail": str(exc)}},
                         )
                         if attempt < effective_max_retries - 1:
                             time.sleep(min(2 ** attempt * 0.5, 4.0))
@@ -347,16 +353,23 @@ class RpcGateway:
                         self._disabled_methods.add(method)
                         self.logger.error(
                             "rpc_method_disabled",
-                            extra={"fields": {"method": method, "detail": str(exc), "confirmations": count}},
+                            extra={"fields": {"method": method, "params": params, "detail": str(exc), "confirmations": count}},
                         )
                         raise RpcMethodDisabled(
                             f"{method} permanently disabled this run after {count} sustained rejections: {exc}"
                         ) from exc
+                    # `params` included here on purpose: the earlier version
+                    # of this warning only logged the error message, which
+                    # meant confirming what the OUTGOING request actually
+                    # contained (e.g. whether maxSupportedTransactionVersion
+                    # was really being sent) required reproducing the call
+                    # by hand against the provider directly. It's now right
+                    # here in the log line instead.
                     self.logger.warning(
                         "rpc_method_possibly_unavailable",
                         extra={
                             "fields": {
-                                "method": method, "detail": str(exc), "confirmations": count,
+                                "method": method, "params": params, "detail": str(exc), "confirmations": count,
                                 "threshold": self.method_disable_threshold,
                             }
                         },

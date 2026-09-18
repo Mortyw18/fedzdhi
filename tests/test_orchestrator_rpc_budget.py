@@ -45,12 +45,14 @@ class _AlwaysOutageRpc:
     def __init__(self) -> None:
         self.call_count = 0
         self.calls: list[tuple] = []  # (method, max_retries) per call, for asserting the max_retries=1 override
+        self.params_log: list = []  # raw params per call, for asserting the exact outgoing request shape
         self.budget = _FakeBudget(usage_pct=0.0)
         self._disabled: set[str] = set()
 
     def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
         self.calls.append((method, max_retries, allow_method_disable))
+        self.params_log.append(params)
         raise RpcOutage("simulated outage")
 
     def is_method_disabled(self, method):
@@ -232,6 +234,33 @@ def test_index_loop_calls_getTransaction_with_max_retries_one(tmp_path):
     asyncio.run(drive())
 
     assert orch.rpc.calls == [("getTransaction", 1, False)]
+
+
+def test_index_loop_getTransaction_always_requests_versioned_tx_support(tmp_path):
+    """Regression coverage for a specific misdiagnosis: on a free RPC tier,
+    a versioned transaction fetched WITHOUT maxSupportedTransactionVersion
+    in the config object errors with a message that contains the substring
+    "not supported" -- which _looks_like_method_unavailable (rpc_gateway.py)
+    treats as "this method looks plan-gated," not as "this one request
+    needs one more config field." That misread would eventually accumulate
+    method_disable_threshold sustained rejections and permanently disable
+    getTransaction, exactly the symptom a silent pool_events funnel showed
+    in production. Confirms indexing's actual outgoing request config
+    always sets maxSupportedTransactionVersion=0 -- unconditionally, since
+    virtually all modern Solana transactions are versioned."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch._ws = _FakeWs(_notifications(1))
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    assert len(orch.rpc.params_log) == 1
+    signature, config = orch.rpc.params_log[0]
+    assert config["maxSupportedTransactionVersion"] == 0
 
 
 def test_index_loop_never_lets_getTransaction_be_permanently_disabled(tmp_path):

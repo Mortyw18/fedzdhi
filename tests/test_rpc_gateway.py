@@ -384,6 +384,27 @@ def test_allow_method_disable_false_never_disables_regardless_of_confirmations(m
     assert session.calls == 10
 
 
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_disabled_method_state_never_survives_a_new_gateway_instance(mock_sleep):
+    """_disabled_methods is in-process memory only -- nothing persists it
+    to disk. A method disabled on one RpcGateway (standing in for one
+    process's lifetime) must not carry over to a freshly constructed one
+    (standing in for a restart): there is no state file to clear."""
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+    assert gw.is_method_disabled("getProgramAccounts") is True
+
+    fresh_session = _ScriptedSession([("ok", _ok_body("value"))])
+    fresh_gw = RpcGateway("http://primary.invalid", session=fresh_session, max_retries=1)
+    assert fresh_gw.is_method_disabled("getProgramAccounts") is False
+    assert fresh_gw.call("getProgramAccounts") == "value"
+
+
 # ----------------------------------------------------------------------
 # per-call max_retries override
 # ----------------------------------------------------------------------
