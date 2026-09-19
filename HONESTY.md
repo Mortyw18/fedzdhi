@@ -180,6 +180,22 @@ nonzero, that program's detection logic is the first thing to
 re-verify -- and DexScreener polling, still running unchanged as the
 backup path, means a missed detection here is a delay, not a blind spot.
 
+**A second, earlier gate now sits in front of the check above:**
+`matches_creation_log_hint` decides whether a getTransaction fetch is
+even worth making, by matching content in the `logsSubscribe`
+notification itself (pump.fun's Anchor-generated "Instruction: Create"
+log; Raydium's own `ray_log` LogType discriminant) -- see its docstring
+in pool_events.py for the verified sources this is built on and the
+production numbers that motivated it (a random rate-capped sample of ALL
+traffic could statistically never catch a rare creation). Same failure
+shape as above: if this pre-filter's assumption about either program's
+logging format is ever wrong, it fails closed (the notification is never
+even fetched, not fetched-and-misjudged) -- a missed detection, never a
+fabricated one. The broad, throttled sample InsiderRadar's indexing still
+separately runs continues to also check every transaction it fetches
+through the same byte-level `detect_pool_creation`, as a fallback that
+doesn't depend on the log pre-filter's assumptions holding.
+
 ## What would genuinely surprise us
 
 A result that would be a genuine, non-obvious surprise: the conviction

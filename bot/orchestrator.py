@@ -37,7 +37,7 @@ from bot.models import (
     WalletBuyRecord,
     WalletSellRecord,
 )
-from bot.pool_events import PoolCreationEvent, detect_pool_creation
+from bot.pool_events import PoolCreationEvent, detect_pool_creation, matches_creation_log_hint
 from bot.risk_manager import RiskManager
 from bot.rpc_gateway import RpcGateway, RpcMethodDisabled, RpcOutage, RpcWebSocket
 from bot.signal_engine import SignalEngine
@@ -465,6 +465,25 @@ class Orchestrator:
         """
         self._pool_events_seen += 1
         event = detect_pool_creation(tx, signature, program_id)
+        # TEMPORARY diagnostic visibility, added while confirming the
+        # log-content pre-filter (matches_creation_log_hint) actually
+        # gates fetches correctly in production -- shows exactly what the
+        # matcher saw for every transaction it fetched. Safe to downgrade
+        # to DEBUG (or remove) once ws_pool_events_matched is confirmed
+        # climbing above zero with this pre-filter live; now much lower
+        # volume than before, since this only fires for pre-filtered
+        # candidates plus whatever the broad, throttled sample still
+        # separately fetches for InsiderRadar's purpose.
+        self.logger.info(
+            "pool_event_checked",
+            extra={
+                "fields": {
+                    "program": INDEXED_PROGRAM_IDS.get(program_id, program_id),
+                    "signature": signature,
+                    "matched": event is not None,
+                }
+            },
+        )
         if event is None:
             return
         self._pool_events_matched += 1
@@ -566,25 +585,15 @@ class Orchestrator:
         while self._indexing_call_timestamps and self._indexing_call_timestamps[0] < cutoff:
             self._indexing_call_timestamps.popleft()
 
-    def _indexing_skip_reason(self) -> Optional[str]:
-        """Indexing is the lowest-priority RPC consumer in this bot: it's
-        background learning, not a trade that's waiting on a price. A
-        subscription to an AMM program's logs can be an enormous stream
-        (most swap activity network-wide mentions it, not just our own
-        candidates), so it must never be what pushes RPC usage into the
-        danger zone TokenSafety and ExitMonitor actually depend on.
-
-        This is the ONE gate both concurrent indexing loops (one per entry
-        in INDEXED_PROGRAM_IDS) check before every notification, which is
-        exactly what makes the backoff/rate-cap/calls-per-minute state
-        below actually global instead of each loop independently deciding
-        for itself -- see indexing_rpc_failure_backoff_base_s's docstring
-        in config.py for the incident that made per-loop state useless.
-
-        Returns a reason string if the current notification should be
-        dropped without ever making an RPC call, or None if it's fine to
-        proceed. Kept as a small, pure, synchronous method so the backoff
-        policy is directly testable without spinning up the async loop.
+    def _indexing_safety_skip_reason(self) -> Optional[str]:
+        """Checks that apply to EVERY getTransaction call indexing ever
+        makes, whether it's the broad rate-capped traffic sample below or
+        a pre-filtered pool-creation candidate (see
+        _candidate_fetch_skip_reason): a halted kill switch, a
+        permanently-disabled getTransaction, or an active backoff from a
+        genuine, recent RPC failure. None of these are about bounding the
+        COST of blind sampling -- they're "is it even safe/possible to
+        call this method right now" -- so both call sites share them.
         """
         if self.kill_switch.is_halted():
             return f"kill switch halted ({self.kill_switch.halt_reason()})"
@@ -593,6 +602,41 @@ class Orchestrator:
         remaining = self._indexing_backoff_until - time.monotonic()
         if remaining > 0:
             return f"backing off ({remaining:.1f}s remaining)"
+        return None
+
+    def _indexing_skip_reason(self) -> Optional[str]:
+        """Indexing is the lowest-priority RPC consumer in this bot: it's
+        background learning, not a trade that's waiting on a price. A
+        subscription to an AMM program's logs can be an enormous stream
+        (most swap activity network-wide mentions it, not just our own
+        candidates), so it must never be what pushes RPC usage into the
+        danger zone TokenSafety and ExitMonitor actually depend on.
+
+        This is the gate the BROAD traffic sample (feeding InsiderRadar's
+        indexing) checks before every notification it considers fetching,
+        which is exactly what makes the backoff/rate-cap/calls-per-minute
+        state below actually global instead of each loop independently
+        deciding for itself -- see indexing_rpc_failure_backoff_base_s's
+        docstring in config.py for the incident that made per-loop state
+        useless. Pool-creation candidates pre-filtered by
+        matches_creation_log_hint do NOT go through this gate -- see
+        _candidate_fetch_skip_reason: the calls/min cap and RPC-budget
+        ceiling below exist specifically to bound the cost of blindly
+        sampling ALL traffic, and reapplying them to a already-cheaply-
+        filtered rare candidate would recreate the exact "can a rare real
+        creation ever survive the sample" problem this pre-filter exists
+        to fix (confirmed in production: ws_pool_events_matched stuck at 0
+        while indexing_skipped climbed into the tens of thousands from
+        this cap alone).
+
+        Returns a reason string if the current notification should be
+        dropped without ever making an RPC call, or None if it's fine to
+        proceed. Kept as a small, pure, synchronous method so the backoff
+        policy is directly testable without spinning up the async loop.
+        """
+        reason = self._indexing_safety_skip_reason()
+        if reason is not None:
+            return reason
         self._prune_indexing_call_window()
         if len(self._indexing_call_timestamps) >= self.config.indexing_max_calls_per_minute:
             return f"indexing calls/min cap reached ({self.config.indexing_max_calls_per_minute}/min)"
@@ -601,19 +645,170 @@ class Orchestrator:
             return f"RPC budget usage {usage:.0%} >= indexing ceiling {self.config.indexing_max_rpc_budget_pct:.0%}"
         return None
 
+    def _candidate_fetch_skip_reason(self) -> Optional[str]:
+        """Like _indexing_skip_reason, but for a getTransaction fetch
+        already pre-filtered by matches_creation_log_hint -- a rare,
+        specifically-flagged candidate, not a blind sample of ALL traffic.
+        The two throttles that exist purely to bound blind-sampling COST
+        (the calls/min cap and its min-interval pacing sleep, both in
+        _index_program_loop) are skipped entirely for these. The RPC
+        budget ceiling is NOT skipped: it protects TokenSafety/ExitMonitor
+        from ever being starved by background indexing, a safety property
+        that must hold regardless of which path triggered the call.
+        """
+        reason = self._indexing_safety_skip_reason()
+        if reason is not None:
+            return reason
+        usage = self.rpc.budget.current_usage_pct()
+        if usage >= self.config.indexing_max_rpc_budget_pct:
+            return f"RPC budget usage {usage:.0%} >= indexing ceiling {self.config.indexing_max_rpc_budget_pct:.0%}"
+        return None
+
+    async def _fetch_indexed_transaction(self, signature: str, program_id: str) -> Optional[dict]:
+        """The actual getTransaction fetch + failure/backoff bookkeeping,
+        shared by both indexing paths in _index_program_loop below (the
+        broad rate-capped traffic sample, and the free log-content
+        pre-filter's rare pool-creation candidates) -- the RPC call and
+        its failure handling are identical either way; only the THROTTLE
+        checked before calling this differs (_indexing_skip_reason vs
+        _candidate_fetch_skip_reason).
+        """
+        try:
+            tx = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self.rpc.call(
+                    "getTransaction",
+                    # Read live off self.rpc, not a hardcoded literal:
+                    # RpcGateway bumps this in place the moment it sees
+                    # a -32015 "transaction version not supported"
+                    # response, and every subsequent call (this one
+                    # included, on the next notification) should use
+                    # the corrected value from the start rather than
+                    # re-discovering it on every single call.
+                    [signature, {
+                        "encoding": "jsonParsed", "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": self.rpc.max_supported_transaction_version,
+                    }],
+                    # RpcGateway's own internal retry loop (default 3
+                    # attempts, with sleeps between) would otherwise run
+                    # on EVERY single call regardless of what indexing's
+                    # own backoff below is doing -- at up to ~1.5s of
+                    # wall time per failing call, that retry-inside-a-
+                    # retry was what actually produced the "still every
+                    # 1-3s, looks like fixed-interval retry" pattern,
+                    # not a lack of backoff. One attempt here means
+                    # indexing's own exponential backoff is the sole
+                    # authority over how long a failure costs.
+                    max_retries=1,
+                    # getTransaction must NEVER be permanently disabled:
+                    # it's the single most fundamental Solana read
+                    # method, not the kind of plan-gated enhanced
+                    # endpoint RpcMethodDisabled exists for, and both
+                    # InsiderRadar indexing and event-driven discovery
+                    # (pool_events) ride on this exact call. A single
+                    # spurious 403 (WAF blip, proxy hiccup, anything
+                    # unrelated to "this method is unavailable")
+                    # permanently disabling it went completely silent
+                    # for a full run in production before this flag
+                    # existed -- indexing's own exponential backoff
+                    # above already handles a genuine sustained outage
+                    # on this call site without needing the disable
+                    # mechanism too.
+                    allow_method_disable=False,
+                ),
+            )
+            self._indexing_rpc_consecutive_failures = 0
+            return tx
+        except RpcMethodDisabled as exc:
+            # Permanently rejected (403, or a JSON-RPC error that reads
+            # like "not available on this plan") -- RpcGateway already
+            # logged rpc_method_disabled ONCE, the instant it detected
+            # this. Nothing left to do here: _indexing_skip_reason()/
+            # _candidate_fetch_skip_reason() above will drop every future
+            # notification before ever reaching this call again, so
+            # there's no ongoing failure to back off from or log
+            # repeatedly.
+            self.logger.debug("indexing notification dropped: %s", exc)
+            return None
+        except RpcOutage as exc:
+            # Indexing is best-effort background learning, not a trade
+            # waiting on a price -- its RPC failures must degrade
+            # gracefully and NEVER touch the kill switch (that's fed
+            # exclusively by TokenSafety's price-critical checks, see
+            # evaluate_candidate). The method + error are logged every
+            # time so a real outage is still fully diagnosable from the
+            # logs alone.
+            self._indexing_rpc_consecutive_failures += 1
+            self.logger.warning(
+                "indexing_rpc_failure",
+                extra={
+                    "fields": {
+                        "method": "getTransaction",
+                        "program_id": program_id,
+                        "consecutive": self._indexing_rpc_consecutive_failures,
+                        "error": str(exc),
+                    }
+                },
+            )
+            # Exponential from the very first failure, not after a
+            # grace threshold -- and written to the SHARED
+            # _indexing_backoff_until timestamp rather than an
+            # await-sleep in just this task, so it's respected by every
+            # concurrent indexing loop via _indexing_skip_reason() above,
+            # not just the one that happened to hit the failure.
+            backoff = min(
+                self.config.indexing_rpc_failure_backoff_base_s
+                * (2 ** (self._indexing_rpc_consecutive_failures - 1)),
+                self.config.indexing_rpc_failure_backoff_max_s,
+            )
+            self._indexing_backoff_until = time.monotonic() + backoff
+            self.logger.warning(
+                "indexing_backing_off",
+                extra={
+                    "fields": {
+                        "program_id": program_id,
+                        "backoff_s": backoff,
+                        "consecutive_failures": self._indexing_rpc_consecutive_failures,
+                    }
+                },
+            )
+            return None
+
     async def _index_program_loop(self, program_id: str) -> None:
         if self._ws is None:
             return
         async for notification in self._ws.logs_subscribe(program_id):
             if self.stop_event.is_set():
                 return
+            value = notification.get("value") or {}
+            signature = value.get("signature")
+            if not signature:
+                continue
+
+            # --- free pre-filter: pool-creation candidates bypass the
+            # blind-sampling throttle entirely, since checking the
+            # notification's OWN log content costs zero RPC calls -- see
+            # matches_creation_log_hint's docstring in pool_events.py for
+            # why the old "randomly sample a rate-capped handful of ALL
+            # traffic per minute" design could statistically never catch a
+            # rare pool-creation event once real traffic (thousands/min)
+            # exceeded that sample by orders of magnitude.
+            if self.config.enable_event_driven_discovery and matches_creation_log_hint(value.get("logs") or [], program_id):
+                skip_reason = self._candidate_fetch_skip_reason()
+                if skip_reason is not None:
+                    self._indexing_skipped_count += 1
+                    self.logger.debug("pool creation candidate dropped: %s", skip_reason)
+                else:
+                    tx = await self._fetch_indexed_transaction(signature, program_id)
+                    if tx:
+                        self._parse_leader_activity(tx, signature)
+                        self._check_pool_creation(tx, signature, program_id)
+                continue  # already fetched (or deliberately dropped) -- don't also run the broad sample below
+
             skip_reason = self._indexing_skip_reason()
             if skip_reason is not None:
                 self._indexing_skipped_count += 1
                 self.logger.debug("indexing notification dropped: %s", skip_reason)
-                continue
-            signature = (notification.get("value") or {}).get("signature")
-            if not signature:
                 continue
 
             # Hard local rate cap on indexing's OWN getTransaction calls,
@@ -623,7 +818,9 @@ class Orchestrator:
             # AMM program can fire several notifications a second; without
             # this, that turns directly into several RPC calls a second
             # from indexing as a whole, even before any failure has
-            # happened to trigger the backoff path.
+            # happened to trigger the backoff path. Only applies to this
+            # broad sample -- a pre-filtered candidate above already
+            # bypassed it.
             now = time.monotonic()
             elapsed = now - self._indexing_last_call_at
             if elapsed < self.config.indexing_min_call_interval_s:
@@ -631,110 +828,16 @@ class Orchestrator:
             self._indexing_last_call_at = time.monotonic()
             self._indexing_call_timestamps.append(self._indexing_last_call_at)
 
-            try:
-                tx = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: self.rpc.call(
-                        "getTransaction",
-                        # Read live off self.rpc, not a hardcoded literal:
-                        # RpcGateway bumps this in place the moment it sees
-                        # a -32015 "transaction version not supported"
-                        # response, and every subsequent call (this one
-                        # included, on the next notification) should use
-                        # the corrected value from the start rather than
-                        # re-discovering it on every single call.
-                        [signature, {
-                            "encoding": "jsonParsed", "commitment": "confirmed",
-                            "maxSupportedTransactionVersion": self.rpc.max_supported_transaction_version,
-                        }],
-                        # RpcGateway's own internal retry loop (default 3
-                        # attempts, with sleeps between) would otherwise run
-                        # on EVERY single call regardless of what indexing's
-                        # own backoff below is doing -- at up to ~1.5s of
-                        # wall time per failing call, that retry-inside-a-
-                        # retry was what actually produced the "still every
-                        # 1-3s, looks like fixed-interval retry" pattern,
-                        # not a lack of backoff. One attempt here means
-                        # indexing's own exponential backoff is the sole
-                        # authority over how long a failure costs.
-                        max_retries=1,
-                        # getTransaction must NEVER be permanently disabled:
-                        # it's the single most fundamental Solana read
-                        # method, not the kind of plan-gated enhanced
-                        # endpoint RpcMethodDisabled exists for, and both
-                        # InsiderRadar indexing and event-driven discovery
-                        # (pool_events) ride on this exact call. A single
-                        # spurious 403 (WAF blip, proxy hiccup, anything
-                        # unrelated to "this method is unavailable")
-                        # permanently disabling it went completely silent
-                        # for a full run in production before this flag
-                        # existed -- indexing's own exponential backoff
-                        # above already handles a genuine sustained outage
-                        # on this call site without needing the disable
-                        # mechanism too.
-                        allow_method_disable=False,
-                    ),
-                )
-                self._indexing_rpc_consecutive_failures = 0
-                if tx:
-                    self._parse_leader_activity(tx, signature)
-                    if self.config.enable_event_driven_discovery:
-                        # Same already-fetched transaction, no extra RPC
-                        # cost -- see _check_pool_creation's docstring for
-                        # why this rides on indexing's existing
-                        # subscription instead of a separate one.
-                        self._check_pool_creation(tx, signature, program_id)
-            except RpcMethodDisabled as exc:
-                # Permanently rejected (403, or a JSON-RPC error that reads
-                # like "not available on this plan") -- RpcGateway already
-                # logged rpc_method_disabled ONCE, the instant it detected
-                # this. Nothing left to do here: _indexing_skip_reason()
-                # above will drop every future notification before ever
-                # reaching this call again, so there's no ongoing failure
-                # to back off from or log repeatedly.
-                self.logger.debug("indexing notification dropped: %s", exc)
-            except RpcOutage as exc:
-                # Indexing is best-effort background learning, not a trade
-                # waiting on a price -- its RPC failures must degrade
-                # gracefully and NEVER touch the kill switch (that's fed
-                # exclusively by TokenSafety's price-critical checks, see
-                # evaluate_candidate). The method + error are logged every
-                # time so a real outage is still fully diagnosable from the
-                # logs alone.
-                self._indexing_rpc_consecutive_failures += 1
-                self.logger.warning(
-                    "indexing_rpc_failure",
-                    extra={
-                        "fields": {
-                            "method": "getTransaction",
-                            "program_id": program_id,
-                            "consecutive": self._indexing_rpc_consecutive_failures,
-                            "error": str(exc),
-                        }
-                    },
-                )
-                # Exponential from the very first failure, not after a
-                # grace threshold -- and written to the SHARED
-                # _indexing_backoff_until timestamp rather than an
-                # await-sleep in just this task, so it's respected by every
-                # concurrent indexing loop via _indexing_skip_reason() above,
-                # not just the one that happened to hit the failure.
-                backoff = min(
-                    self.config.indexing_rpc_failure_backoff_base_s
-                    * (2 ** (self._indexing_rpc_consecutive_failures - 1)),
-                    self.config.indexing_rpc_failure_backoff_max_s,
-                )
-                self._indexing_backoff_until = time.monotonic() + backoff
-                self.logger.warning(
-                    "indexing_backing_off",
-                    extra={
-                        "fields": {
-                            "program_id": program_id,
-                            "backoff_s": backoff,
-                            "consecutive_failures": self._indexing_rpc_consecutive_failures,
-                        }
-                    },
-                )
+            tx = await self._fetch_indexed_transaction(signature, program_id)
+            if tx:
+                self._parse_leader_activity(tx, signature)
+                if self.config.enable_event_driven_discovery:
+                    # Same already-fetched transaction, no extra RPC cost.
+                    # Now a secondary/redundant check (the log pre-filter
+                    # above is the primary detection path) -- kept as a
+                    # zero-extra-cost fallback in case the log heuristic
+                    # ever misses a genuine creation.
+                    self._check_pool_creation(tx, signature, program_id)
 
     # ------------------------------------------------------------------
     # daily/weekly reporting
