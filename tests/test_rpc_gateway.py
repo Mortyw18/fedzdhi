@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 import requests
 
-from bot.rpc_gateway import RateBudget, RpcGateway, RpcMethodDisabled, RpcOutage
+from bot.rpc_gateway import RateBudget, RpcError, RpcGateway, RpcMethodDisabled, RpcOutage
 
 
 def _ok_body(result="pong"):
@@ -238,51 +238,102 @@ def test_rate_budget_rearms_only_after_dropping_to_clear_threshold():
 
 
 # ----------------------------------------------------------------------
-# permanent method rejection (403 / "method not available") detection
+# permanent method rejection (403 / "method not available") detection --
+# requires method_disable_threshold SUSTAINED confirmations (separate
+# call() invocations, not retries of one request) before actually
+# disabling a method. A single 403 used to disable immediately, which was
+# a real bug: getTransaction (an utterly ordinary method no free tier
+# restricts) got permanently killed by one non-representative 403 in
+# production, silencing indexing and event-driven discovery for the rest
+# of the run. See RpcMethodDisabled's docstring.
 # ----------------------------------------------------------------------
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
-def test_403_disables_the_method_immediately_no_further_retries(mock_sleep):
+def test_a_single_403_does_not_disable_the_method(mock_sleep):
     session = _ScriptedSession([("403",)])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+
+    assert gw.is_method_disabled("getProgramAccounts") is False
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_403_disables_the_method_after_sustained_confirmations(mock_sleep):
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    for _ in range(gw.method_disable_threshold - 1):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
+        assert gw.is_method_disabled("getProgramAccounts") is False
 
     with pytest.raises(RpcMethodDisabled):
         gw.call("getProgramAccounts")
-
-    assert session.calls == 1  # not max_retries=5 -- a 403 is never worth retrying
     assert gw.is_method_disabled("getProgramAccounts") is True
+    assert session.calls == 3
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_a_success_in_between_resets_the_confirmation_streak(mock_sleep):
+    session = _ScriptedSession([("403",), ("403",), ("ok", _ok_body()), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+    gw.call("getProgramAccounts")  # succeeds -- resets the streak
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+    with pytest.raises(RpcOutage):
+        gw.call("getProgramAccounts")
+
+    assert gw.is_method_disabled("getProgramAccounts") is False  # never 3 IN A ROW
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
 def test_disabled_method_fails_instantly_on_next_call_no_network(mock_sleep):
-    session = _ScriptedSession([("403",)])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    for _ in range(gw.method_disable_threshold - 1):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+    assert session.calls == 3
 
     with pytest.raises(RpcMethodDisabled):
         gw.call("getProgramAccounts")
-    assert session.calls == 1
-
-    with pytest.raises(RpcMethodDisabled):
-        gw.call("getProgramAccounts")
-    assert session.calls == 1  # still 1 -- the second call never touched the network
+    assert session.calls == 3  # still 3 -- this call never touched the network
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
-def test_jsonrpc_method_not_found_code_disables_the_method(mock_sleep):
-    session = _ScriptedSession([("jsonrpc_error", {"code": -32601, "message": "Method not found"})])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+def test_jsonrpc_method_not_found_code_disables_after_sustained_confirmations(mock_sleep):
+    session = _ScriptedSession([("jsonrpc_error", {"code": -32601, "message": "Method not found"})] * 3)
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
 
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getSomeEnhancedMethod")
     with pytest.raises(RpcMethodDisabled):
         gw.call("getSomeEnhancedMethod")
     assert gw.is_method_disabled("getSomeEnhancedMethod") is True
 
 
 @mock.patch("bot.rpc_gateway.time.sleep")
-def test_jsonrpc_plan_gated_message_disables_the_method(mock_sleep):
-    session = _ScriptedSession([("jsonrpc_error", {"code": -32000, "message": "This method is not available on your current plan"})])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+def test_jsonrpc_plan_gated_message_disables_after_sustained_confirmations(mock_sleep):
+    session = _ScriptedSession(
+        [("jsonrpc_error", {"code": -32000, "message": "This method is not available on your current plan"})] * 3
+    )
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
 
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getSomeEnhancedMethod")
     with pytest.raises(RpcMethodDisabled):
         gw.call("getSomeEnhancedMethod")
     assert gw.is_method_disabled("getSomeEnhancedMethod") is True
@@ -306,11 +357,164 @@ def test_ordinary_jsonrpc_error_does_not_disable_the_method(mock_sleep):
 
 @mock.patch("bot.rpc_gateway.time.sleep")
 def test_disabled_methods_listed_in_call_stats(mock_sleep):
-    session = _ScriptedSession([("403",)])
-    gw = RpcGateway("http://primary.invalid", session=session, max_retries=5)
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
     with pytest.raises(RpcMethodDisabled):
         gw.call("getProgramAccounts")
     assert gw.get_call_stats()["disabled_methods"] == ["getProgramAccounts"]
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_allow_method_disable_false_never_disables_regardless_of_confirmations(mock_sleep):
+    """Orchestrator's indexing loop passes this for getTransaction:
+    already has its own dedicated sustained-failure backoff, and
+    getTransaction is fundamental enough that treating any rejection of
+    it as a permanent plan restriction was mis-scoped to begin with."""
+    session = _ScriptedSession([("403",)] * 10)
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    for _ in range(10):
+        with pytest.raises(RpcOutage):
+            gw.call("getTransaction", allow_method_disable=False)
+
+    assert gw.is_method_disabled("getTransaction") is False
+    assert session.calls == 10
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_disabled_method_state_never_survives_a_new_gateway_instance(mock_sleep):
+    """_disabled_methods is in-process memory only -- nothing persists it
+    to disk. A method disabled on one RpcGateway (standing in for one
+    process's lifetime) must not carry over to a freshly constructed one
+    (standing in for a restart): there is no state file to clear."""
+    session = _ScriptedSession([("403",), ("403",), ("403",)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+    for _ in range(2):
+        with pytest.raises(RpcOutage):
+            gw.call("getProgramAccounts")
+    with pytest.raises(RpcMethodDisabled):
+        gw.call("getProgramAccounts")
+    assert gw.is_method_disabled("getProgramAccounts") is True
+
+    fresh_session = _ScriptedSession([("ok", _ok_body("value"))])
+    fresh_gw = RpcGateway("http://primary.invalid", session=fresh_session, max_retries=1)
+    assert fresh_gw.is_method_disabled("getProgramAccounts") is False
+    assert fresh_gw.call("getProgramAccounts") == "value"
+
+
+# ----------------------------------------------------------------------
+# -32015 "transaction version not supported" auto-bump: root cause of the
+# same production silence above one layer down -- the free tier really
+# did support getTransaction fine, but maxSupportedTransactionVersion in
+# the request was lower than the chain's current transaction version, and
+# that error's message ("...not supported...") would otherwise be
+# misread by _looks_like_method_unavailable as a plan-gating rejection.
+# ----------------------------------------------------------------------
+
+
+def _version_error(required_version: int) -> dict:
+    return {
+        "code": -32015,
+        "message": (
+            f"Transaction version ({required_version}) is not supported by the requesting "
+            f'client. Please try the request again with the following configuration '
+            f'parameter: "maxSupportedTransactionVersion": {required_version}'
+        ),
+    }
+
+
+def test_a_single_version_error_never_disables_the_method():
+    """The exact misdiagnosis this fixes: -32015's message contains "not
+    supported," which _looks_like_method_unavailable would otherwise match
+    -- confirms it never even counts toward the disable-threshold streak."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(1)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1)
+
+    result = gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
+
+    assert result == "tx-data"
+    assert gw.is_method_disabled("getTransaction") is False
+
+
+def test_version_error_bumps_the_live_default_and_retries_in_place():
+    session = _ScriptedSession([("jsonrpc_error", _version_error(1)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    result = gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
+
+    assert result == "tx-data"
+    assert gw.max_supported_transaction_version == 1
+    # The retried request actually carried the bumped value, not the stale one.
+    assert session.script == []  # both scripted responses were consumed (one -32015, one ok)
+
+
+def test_version_error_patches_the_params_object_passed_by_the_caller():
+    """The caller's own params list is mutated in place, so a caller that
+    builds its config dict once and reuses the reference (as both
+    orchestrator.py and execution_engine.py effectively do by reading
+    rpc.max_supported_transaction_version fresh each call) sees the
+    corrected value reflected immediately."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(3)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+    config = {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+    params = ["sig1", config]
+
+    result = gw.call("getTransaction", params)
+
+    assert result == "tx-data"
+    assert config["maxSupportedTransactionVersion"] == 3  # mutated in place
+
+
+def test_version_error_bump_uses_the_parsed_required_version_not_a_blind_increment():
+    """A jump straight from 0 to 5 (not 0 -> 1 -> 2 -> ... -> 5) confirms
+    the required version is actually parsed out of the message, not just
+    incremented by one per failure."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(5)), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
+
+    assert gw.max_supported_transaction_version == 5
+
+
+def test_version_error_bump_never_decreases_the_live_default():
+    """A malformed/unparseable message (defensive case) must still make
+    progress (avoid looping forever on the exact same request) rather than
+    parsing a version lower than what's already set."""
+    session = _ScriptedSession([("jsonrpc_error", {"code": -32015, "message": "not supported, no number here"}), ("ok", _ok_body("tx-data"))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=4)
+
+    gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 4}])
+
+    assert gw.max_supported_transaction_version == 5  # conservative +1, never stuck or decreased
+
+
+def test_version_error_with_nothing_to_patch_surfaces_as_an_ordinary_error():
+    """A method that hits -32015 but whose params never even carried
+    maxSupportedTransactionVersion can't be fixed by bumping the instance
+    default -- must fail cleanly instead of retrying the identical request
+    forever."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(1))])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    with pytest.raises(RpcError):
+        gw.call("someOtherMethod", ["sig1"])  # no config dict at all in params
+
+    assert gw.max_supported_transaction_version == 1  # still bumped -- just couldn't help THIS call
+
+
+@mock.patch("bot.rpc_gateway.time.sleep")
+def test_version_error_that_keeps_recurring_gives_up_after_a_bounded_number_of_bumps(mock_sleep):
+    """A provider that keeps demanding a higher version on every single
+    response (pathological/defensive case) must not spin forever."""
+    session = _ScriptedSession([("jsonrpc_error", _version_error(n)) for n in range(1, 20)])
+    gw = RpcGateway("http://primary.invalid", session=session, max_retries=1, max_supported_transaction_version=0)
+
+    with pytest.raises(RpcOutage):
+        gw.call("getTransaction", ["sig1", {"maxSupportedTransactionVersion": 0}])
 
 
 # ----------------------------------------------------------------------

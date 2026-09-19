@@ -39,6 +39,9 @@ class FakeRpc:
         # (e.g. "holder concentration must not cost more than a handful of
         # calls") without needing a real RpcGateway's budget tracker.
         self.call_log: list[str] = []
+        # ExecutionEngine reads this live off self.rpc (see execution_engine.py)
+        # rather than hardcoding a version literal.
+        self.max_supported_transaction_version = 1
 
     def get_account_info(self, pubkey, encoding="jsonParsed"):
         self.call_log.append("getAccountInfo")

@@ -9,6 +9,8 @@ levels this is built on).
 """
 from __future__ import annotations
 
+import base64
+
 import base58
 
 from bot.jupiter_client import SOL_MINT
@@ -19,6 +21,7 @@ from bot.pool_events import (
     RAYDIUM_INITIALIZE2_DISCRIMINATOR,
     anchor_discriminator,
     detect_pool_creation,
+    matches_creation_log_hint,
     resolve_new_mint,
 )
 
@@ -237,3 +240,82 @@ def test_inner_instruction_creation_call_is_not_detected():
     inner_ix = tx["transaction"]["message"]["instructions"].pop()
     tx["meta"]["innerInstructions"].append({"index": 0, "instructions": [inner_ix]})
     assert detect_pool_creation(tx, "sig", RAYDIUM_AMM_V4_PROGRAM_ID) is None
+
+
+# ----------------------------------------------------------------------
+# matches_creation_log_hint: the free, pre-getTransaction pre-filter over
+# a logsSubscribe notification's OWN log lines. This is what makes
+# event-driven discovery viable under a rate-capped RPC budget -- see the
+# function's docstring in pool_events.py for the production numbers
+# (ws_pool_events_seen=244, matched=0, indexing_skipped climbing into the
+# tens of thousands) that motivated it: random-sampling ~60/min of ALL
+# traffic could never be expected to land on a rare pool-creation event.
+# ----------------------------------------------------------------------
+
+
+def _ray_log_line(log_type: int, payload: bytes = b"") -> str:
+    encoded = base64.b64encode(bytes([log_type]) + payload).decode()
+    return f"Program log: ray_log: {encoded}"
+
+
+def test_pumpfun_create_instruction_log_matches():
+    logs = [
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Create",
+        "Program data: some_base64_event_payload==",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+    ]
+    assert matches_creation_log_hint(logs, PUMPFUN_BONDING_CURVE_PROGRAM_ID) is True
+
+
+def test_pumpfun_ordinary_swap_logs_do_not_match():
+    logs = [
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Buy",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+    ]
+    assert matches_creation_log_hint(logs, PUMPFUN_BONDING_CURVE_PROGRAM_ID) is False
+
+
+def test_raydium_init_log_type_matches():
+    """LogType::Init (discriminant 0) covers pool initialization --
+    raydium-amm/program/src/log.rs's encode_ray_log format."""
+    logs = [
+        f"Program {RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]",
+        _ray_log_line(0, b"rest-of-init-log-payload"),
+        f"Program {RAYDIUM_AMM_V4_PROGRAM_ID} success",
+    ]
+    assert matches_creation_log_hint(logs, RAYDIUM_AMM_V4_PROGRAM_ID) is True
+
+
+def test_raydium_swap_log_types_do_not_match():
+    """SwapBaseIn=3 and SwapBaseOut=4 are the overwhelming majority of a
+    busy AMM's traffic -- must never match."""
+    for log_type in (1, 2, 3, 4):  # Deposit, Withdraw, SwapBaseIn, SwapBaseOut
+        logs = [_ray_log_line(log_type, b"payload")]
+        assert matches_creation_log_hint(logs, RAYDIUM_AMM_V4_PROGRAM_ID) is False
+
+
+def test_raydium_no_ray_log_line_does_not_match():
+    logs = [f"Program {RAYDIUM_AMM_V4_PROGRAM_ID} invoke [1]", f"Program {RAYDIUM_AMM_V4_PROGRAM_ID} success"]
+    assert matches_creation_log_hint(logs, RAYDIUM_AMM_V4_PROGRAM_ID) is False
+
+
+def test_malformed_ray_log_base64_does_not_crash():
+    logs = ["Program log: ray_log: not-valid-base64!!!"]
+    assert matches_creation_log_hint(logs, RAYDIUM_AMM_V4_PROGRAM_ID) is False
+
+
+def test_empty_ray_log_payload_does_not_crash():
+    logs = ["Program log: ray_log: "]
+    assert matches_creation_log_hint(logs, RAYDIUM_AMM_V4_PROGRAM_ID) is False
+
+
+def test_unknown_program_id_never_matches():
+    logs = ["Program log: Instruction: Create", _ray_log_line(0)]
+    assert matches_creation_log_hint(logs, "SomeOtherProgram111111111111111111111111111") is False
+
+
+def test_empty_logs_list_does_not_match():
+    assert matches_creation_log_hint([], PUMPFUN_BONDING_CURVE_PROGRAM_ID) is False
+    assert matches_creation_log_hint([], RAYDIUM_AMM_V4_PROGRAM_ID) is False

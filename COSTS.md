@@ -78,14 +78,41 @@ free-tier RPC budget, not just to survive an occasional spike:
   costing up to ~1.5s of extra retry time per failure regardless of what
   indexing's own backoff was doing.
 - **A method RpcGateway detects as permanently rejected (403, or a
-  JSON-RPC error that reads like "not available on this plan") is
-  disabled for the rest of the run.** Every subsequent call to it fails
-  instantly, with zero network I/O -- this matters most for a Helius free
-  tier, where some enhanced/paid-tier-only methods return exactly this
-  shape of error, and retrying one forever on every single call would
-  otherwise burn budget and time for no possible benefit. `rpc_method_disabled`
-  logs once when this happens; `disabled_methods` in `get_call_stats()` /
-  `--daily-report` shows what's currently off.
+  JSON-RPC error that reads like "not available on this plan"), 3
+  separate times, is disabled for the rest of the run.** Every subsequent
+  call to it fails instantly, with zero network I/O -- this matters most
+  for a Helius free tier, where some enhanced/paid-tier-only methods
+  return exactly this shape of error, and retrying one forever on every
+  single call would otherwise burn budget and time for no possible
+  benefit. `rpc_method_disabled` logs once when this happens (with the
+  exact outgoing `params` that triggered it, for diagnosing a
+  misclassification without needing to reproduce the call by hand);
+  `disabled_methods` in `get_call_stats()` / `--daily-report` shows what's
+  currently off. This state is process memory only, never written to
+  disk -- a restart always starts with every method enabled, nothing to
+  clear manually. Indexing's own `getTransaction` call is exempt from
+  ever being disabled at all (`allow_method_disable=False`): it's too
+  fundamental a method to treat any rejection of it as permanent, and
+  indexing already has its own dedicated backoff for a genuine outage
+  on that call.
+- **A getTransaction call for a transaction newer than
+  `rpc_max_supported_transaction_version` (default 1) fails with
+  JSON-RPC code -32015, whose message also contains "not supported" --**
+  handled entirely separately from the disable-detection above (it's
+  never a plan-gating rejection, always fixable by asking with a higher
+  version). `RpcGateway` parses the version the error says it needs
+  straight out of the message, bumps its own live
+  `max_supported_transaction_version` in place, patches it into the
+  in-flight request, and retries immediately -- so a chain-wide move to a
+  newer transaction format self-heals within one call() invocation, and
+  every call after that (both indexing's and ExecutionEngine's own swap
+  confirmation, which both read this value live off `self.rpc` rather
+  than a hardcoded literal) uses the corrected version from then on. Logs
+  `rpc_transaction_version_bumped` once per bump. This was the actual
+  root cause the very first time a production run's getTransaction got
+  3-strike-disabled: the free tier supported the method fine, but the cap
+  in the request was lower than the chain's actual transaction version at
+  the time.
 
 The RPC budget itself is audited, not just capped: `RpcGateway` tracks
 per-method call counts and calls-per-minute live, and the running bot
@@ -119,14 +146,28 @@ load-bearing parts of the pipeline never touch it at all, by design:
   their own `requests.Session`s (pump.fun's coin API, Jupiter's quote API,
   RugCheck) -- none of them touch `RpcGateway` either, same as DexScreener
   and pump.fun's coin-discovery polling above.
-- **Event-driven pool-creation detection costs zero additional RPC calls.**
-  `Orchestrator._check_pool_creation` runs on the SAME transaction the
-  indexing loop already fetched via `getTransaction` for wallet-activity
-  parsing -- it's a second thing done with data already paid for, not a
-  second subscription or a second RPC round-trip. Second-wave's periodic
-  price sampling (`_second_wave_loop`, `SignalEngine.fetch_candidate_by_mint`)
-  also never touches `RpcGateway` -- it's the same DexScreener
-  `requests.Session` as everything else DexScreener-sourced.
+- **Event-driven pool-creation detection is (almost) free, not entirely
+  free.** The BROAD sample InsiderRadar's indexing already runs costs
+  nothing extra: `_check_pool_creation` runs on the SAME transaction
+  already fetched via `getTransaction` for wallet-activity parsing, a
+  second thing done with data already paid for. The log-content
+  pre-filter (`matches_creation_log_hint`, checked against every
+  notification's OWN logs -- genuinely zero cost, no RPC call involved)
+  DOES trigger a dedicated getTransaction call whenever it matches,
+  separate from the broad sample -- this is the actual, deliberate cost
+  of no longer depending on a rare event surviving a rate-capped random
+  sample (see README.md's "Event-driven discovery" section for why that
+  didn't work). It's still bounded: the pre-filter is specific enough
+  that real creations are the overwhelming majority of what it matches
+  (a false positive costs one ordinary getTransaction call that then
+  finds nothing), and it still respects the overall RPC budget ceiling
+  that protects TokenSafety/ExitMonitor (`_candidate_fetch_skip_reason`)
+  -- it only skips the calls/min cap meant to bound the broad sample's
+  cost, not the budget-priority safety check itself. Second-wave's
+  periodic price sampling (`_second_wave_loop`,
+  `SignalEngine.fetch_candidate_by_mint`) also never touches
+  `RpcGateway` -- it's the same DexScreener `requests.Session` as
+  everything else DexScreener-sourced.
 
 So if `TokenSafety.evaluate()` was never invoked (no candidate ever
 passed SignalEngine's filters) and the indexing loop never got as far as

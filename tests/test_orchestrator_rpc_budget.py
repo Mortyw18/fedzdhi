@@ -27,6 +27,7 @@ from unittest import mock
 from bot.config import Config
 from bot.models import Mode
 from bot.orchestrator import Orchestrator
+from bot.pool_events import PUMPFUN_BONDING_CURVE_PROGRAM_ID
 from bot.rpc_gateway import RpcMethodDisabled, RpcOutage
 
 
@@ -45,12 +46,15 @@ class _AlwaysOutageRpc:
     def __init__(self) -> None:
         self.call_count = 0
         self.calls: list[tuple] = []  # (method, max_retries) per call, for asserting the max_retries=1 override
+        self.params_log: list = []  # raw params per call, for asserting the exact outgoing request shape
         self.budget = _FakeBudget(usage_pct=0.0)
         self._disabled: set[str] = set()
+        self.max_supported_transaction_version = 1
 
-    def call(self, method, params=None, max_retries=None):
+    def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
-        self.calls.append((method, max_retries))
+        self.calls.append((method, max_retries, allow_method_disable))
+        self.params_log.append(params)
         raise RpcOutage("simulated outage")
 
     def is_method_disabled(self, method):
@@ -65,8 +69,9 @@ class _AlwaysSucceedsRpc:
         self.call_count = 0
         self.budget = _FakeBudget(usage_pct=0.0)
         self._disabled: set[str] = set()
+        self.max_supported_transaction_version = 1
 
-    def call(self, method, params=None, max_retries=None):
+    def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
         return {"meta": {"preTokenBalances": [], "postTokenBalances": []}, "slot": 1, "transaction": {"message": {"accountKeys": []}}}
 
@@ -81,8 +86,9 @@ class _AlwaysMethodDisabledRpc:
     def __init__(self) -> None:
         self.call_count = 0
         self.budget = _FakeBudget(usage_pct=0.0)
+        self.max_supported_transaction_version = 1
 
-    def call(self, method, params=None, max_retries=None):
+    def call(self, method, params=None, max_retries=None, allow_method_disable=True):
         self.call_count += 1
         raise RpcMethodDisabled(f"{method} permanently disabled this run")
 
@@ -192,6 +198,72 @@ def test_stale_call_timestamps_age_out_of_the_per_minute_window(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# _candidate_fetch_skip_reason: like _indexing_skip_reason, but for a
+# pre-filtered pool-creation candidate (see matches_creation_log_hint) --
+# must share the safety-critical checks (kill switch, disabled method,
+# backoff, RPC budget ceiling) but MUST NOT apply the two throttles that
+# exist purely to bound blind-sampling cost (calls/min cap, its pacing
+# sleep) -- reapplying those to an already-rare, already-filtered
+# candidate would recreate the exact production bug this exists to fix.
+# ----------------------------------------------------------------------
+
+
+def test_candidate_fetch_not_skipped_when_healthy(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc.budget = _FakeBudget(usage_pct=0.1)
+    assert orch._candidate_fetch_skip_reason() is None
+
+
+def test_candidate_fetch_skipped_when_kill_switch_halted(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    for _ in range(orch.kill_switch.max_consecutive_rpc_outages):
+        orch.kill_switch.set_rpc_outage(True)
+    reason = orch._candidate_fetch_skip_reason()
+    assert reason is not None
+    assert "kill switch halted" in reason
+
+
+def test_candidate_fetch_skipped_when_method_already_disabled(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysMethodDisabledRpc()
+    reason = orch._candidate_fetch_skip_reason()
+    assert reason is not None
+    assert "permanently disabled" in reason
+
+
+def test_candidate_fetch_skipped_during_an_active_backoff_window(tmp_path):
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch._indexing_backoff_until = time.monotonic() + 30.0
+    reason = orch._candidate_fetch_skip_reason()
+    assert reason is not None
+    assert "backing off" in reason
+
+
+def test_candidate_fetch_skipped_when_over_the_rpc_budget_ceiling(tmp_path):
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc.budget = _FakeBudget(usage_pct=0.75)  # above the 0.50 ceiling
+    reason = orch._candidate_fetch_skip_reason()
+    assert reason is not None
+    assert "budget" in reason
+
+
+def test_candidate_fetch_not_skipped_when_calls_per_minute_cap_is_exhausted(tmp_path):
+    """The exact bypass this whole mechanism exists for: a pre-filtered
+    candidate must go through even when the broad sample's calls/min cap
+    is completely saturated."""
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch.config.indexing_max_calls_per_minute = 3
+    now = time.monotonic()
+    orch._indexing_call_timestamps.extend([now, now, now])
+    assert orch._indexing_skip_reason() is not None  # the broad path WOULD be skipped
+    assert orch._candidate_fetch_skip_reason() is None  # but a candidate fetch is not
+
+
+# ----------------------------------------------------------------------
 # _index_program_loop: end to end
 # ----------------------------------------------------------------------
 
@@ -231,7 +303,78 @@ def test_index_loop_calls_getTransaction_with_max_retries_one(tmp_path):
 
     asyncio.run(drive())
 
-    assert orch.rpc.calls == [("getTransaction", 1)]
+    assert orch.rpc.calls == [("getTransaction", 1, False)]
+
+
+def test_index_loop_getTransaction_always_requests_versioned_tx_support(tmp_path):
+    """Regression coverage for a specific misdiagnosis: on a free RPC tier,
+    a versioned transaction fetched with maxSupportedTransactionVersion set
+    too LOW for that transaction's actual version errors with JSON-RPC code
+    -32015 and a message containing the substring "not supported" -- which
+    _looks_like_method_unavailable (rpc_gateway.py) would otherwise treat
+    as "this method looks plan-gated" if that code weren't handled upstream
+    (see _TRANSACTION_VERSION_NOT_SUPPORTED_CODE), eventually accumulating
+    method_disable_threshold sustained rejections and permanently disabling
+    getTransaction -- exactly the symptom a silent pool_events funnel
+    showed in production, root-caused to Config.rpc_max_supported_transaction_version
+    (default 1) being too low for transactions the chain had moved past.
+    Confirms indexing's actual outgoing request reads the live value off
+    self.rpc rather than a hardcoded literal, so an auto-bump (see
+    RpcGateway._post_with_auto_version_bump) takes effect immediately."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch.rpc.max_supported_transaction_version = 1
+    orch._ws = _FakeWs(_notifications(1))
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    assert len(orch.rpc.params_log) == 1
+    signature, config = orch.rpc.params_log[0]
+    assert config["maxSupportedTransactionVersion"] == 1
+
+
+def test_index_loop_picks_up_a_bumped_max_supported_transaction_version(tmp_path):
+    """If RpcGateway's live max_supported_transaction_version has already
+    been auto-bumped (e.g. by an earlier -32015 on a different call), the
+    NEXT indexing call must use the bumped value immediately, not the
+    original config default -- this is what makes the auto-bump actually
+    fix every subsequent call, not just retry the one that triggered it."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch.rpc.max_supported_transaction_version = 7  # simulates a prior auto-bump
+    orch._ws = _FakeWs(_notifications(1))
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    signature, config = orch.rpc.params_log[0]
+    assert config["maxSupportedTransactionVersion"] == 7
+
+
+def test_index_loop_never_lets_getTransaction_be_permanently_disabled(tmp_path):
+    """A single spurious 403 permanently disabling getTransaction went
+    completely silent (indexing AND event-driven discovery both ride on
+    this exact call) for a full production run before allow_method_disable
+    existed. Confirms indexing always asks for the exemption."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysOutageRpc()
+    orch._ws = _FakeWs(_notifications(3))
+    orch._indexing_skip_reason = lambda: None  # bypass the backoff gate -- isolates the per-call kwarg, not throttling
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop("SomeProgram")
+
+    asyncio.run(drive())
+
+    assert orch.rpc.calls == [("getTransaction", 1, False)] * 3
 
 
 def test_index_loop_logs_method_and_error_on_each_rpc_failure(tmp_path):
@@ -400,3 +543,108 @@ def test_index_loop_skips_all_notifications_when_budget_is_tight(tmp_path):
 
     assert orch.rpc.call_count == 0  # never even attempted -- budget-priority backoff
     assert orch._indexing_skipped_count == 10
+
+
+# ----------------------------------------------------------------------
+# _index_program_loop: the log-content pre-filter's fast path -- a
+# notification whose OWN logs already look like a pool creation must
+# bypass the calls/min cap entirely, end to end through the real loop
+# (not just the skip-reason unit tests above).
+# ----------------------------------------------------------------------
+
+
+def _creation_notification(signature: str) -> dict:
+    return {"value": {"signature": signature, "logs": ["Program log: Instruction: Create"]}}
+
+
+def _ordinary_notification(signature: str) -> dict:
+    return {"value": {"signature": signature, "logs": ["Program log: Instruction: Buy"]}}
+
+
+def test_index_loop_fetches_a_creation_candidate_even_with_calls_per_minute_cap_exhausted(tmp_path):
+    """The exact production fix: previously, a real pool-creation
+    notification competed with every ordinary swap notification for the
+    same rate-capped ~60/min sample and could statistically never win
+    that lottery. Now it never has to."""
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysSucceedsRpc()
+    orch.config.indexing_max_calls_per_minute = 3
+    now = time.monotonic()
+    orch._indexing_call_timestamps.extend([now, now, now])  # cap already exhausted
+    orch._ws = _FakeWs([_creation_notification("creation-sig")])
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop(PUMPFUN_BONDING_CURVE_PROGRAM_ID)
+
+    asyncio.run(drive())
+
+    assert orch.rpc.call_count == 1  # fetched despite the exhausted cap
+    assert orch._indexing_skipped_count == 0
+
+
+def test_index_loop_still_caps_ordinary_notifications_even_when_a_candidate_bypasses_it(tmp_path):
+    """The bypass is specific to pre-filtered candidates -- ordinary
+    traffic (no matching log content) is still subject to the broad
+    sample's calls/min cap exactly as before."""
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysSucceedsRpc()
+    orch.config.indexing_max_calls_per_minute = 3
+    now = time.monotonic()
+    orch._indexing_call_timestamps.extend([now, now, now])  # cap already exhausted
+    orch._ws = _FakeWs([_ordinary_notification("ordinary-sig")])
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop(PUMPFUN_BONDING_CURVE_PROGRAM_ID)
+
+    asyncio.run(drive())
+
+    assert orch.rpc.call_count == 0  # dropped -- cap still applies to non-candidates
+    assert orch._indexing_skipped_count == 1
+
+
+def test_index_loop_candidate_fetch_still_respects_the_rpc_budget_ceiling(tmp_path):
+    """The bypass is deliberately narrow: the safety-critical RPC budget
+    ceiling (protects TokenSafety/ExitMonitor from starvation) still
+    applies even to a pre-filtered candidate."""
+    orch = _build_orchestrator(tmp_path)
+    orch.rpc = _AlwaysSucceedsRpc()
+    orch.rpc.budget = _FakeBudget(usage_pct=0.75)  # above the 0.50 ceiling
+    orch._ws = _FakeWs([_creation_notification("creation-sig")])
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop(PUMPFUN_BONDING_CURVE_PROGRAM_ID)
+
+    asyncio.run(drive())
+
+    assert orch.rpc.call_count == 0
+    assert orch._indexing_skipped_count == 1
+
+
+def test_index_loop_candidate_fetch_disabled_when_event_driven_discovery_off(tmp_path):
+    """With the feature flag off, a creation-looking notification is
+    treated as ordinary traffic -- no special-casing, no fast path."""
+    import time
+
+    orch = _build_orchestrator(tmp_path)
+    orch.config.enable_event_driven_discovery = False
+    orch.rpc = _AlwaysSucceedsRpc()
+    orch.config.indexing_max_calls_per_minute = 3
+    now = time.monotonic()
+    orch._indexing_call_timestamps.extend([now, now, now])
+    orch._ws = _FakeWs([_creation_notification("creation-sig")])
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop(PUMPFUN_BONDING_CURVE_PROGRAM_ID)
+
+    asyncio.run(drive())
+
+    assert orch.rpc.call_count == 0  # no bypass -- falls through to the (capped) broad path
+    assert orch._indexing_skipped_count == 1

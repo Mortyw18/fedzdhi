@@ -257,7 +257,8 @@ Telegram (`bot/alerter.py::Alerter.enabled`).
 | `TELEGRAM_CHAT_ID` | Required if `TELEGRAM_BOT_TOKEN` is set | The chat Telegram alerts are sent to. |
 | `BANKROLL_SOL` | Recommended | Feeds the ruin table and the position-size-vs-bankroll checks in `Config.validate()`. Set it to what you actually funded. |
 | `DB_PATH` | Optional | SQLite ledger path. Defaults to `data/bot.db`. |
-| `ENABLE_PUMPFUN` | Optional | Set to `false` to skip pump.fun entirely (its API 530ing for extended stretches is common; this stops the circuit breaker wasting retries on it every restart). DexScreener signals and InsiderRadar are unaffected. Default `true`. |
+| `ENABLE_PUMPFUN` | Optional | Controls pump.fun's coin-*list* discovery poll only (a separate, confirmed-530-blocked endpoint from the one below). Default `false` -- set to `true` to re-enable if pump.fun's API recovers. DexScreener signals and InsiderRadar are unaffected either way. |
+| `ENABLE_PUMPFUN_GRADUATION_LOOKUP` | Optional | Controls TokenSafety's graduation/LP-burn lookup (a different pump.fun coin-*info* endpoint from `ENABLE_PUMPFUN` above -- deliberately independent, so a discovery-endpoint outage doesn't also false-reject every pump.fun candidate's safety check). Default `true`; set to `false` only if the coin-info endpoint itself is confirmed dead too. |
 
 Once `.env` is filled in, sanity-check that it loads correctly without
 starting any run that touches RPC or a wallet:
@@ -392,11 +393,13 @@ the real fix, both times, is that this class of failure is no longer silent:
   `solana_pairs` is consistently 0 (or `passed_filters` stays 0 while
   `rejected_by.pool_age` climbs), that's the thing to change, not the
   liquidity/volume thresholds.
-- Every `heartbeat_interval_s` (default 10min) there's one INFO-level
+- Every `heartbeat_interval_s` (default 60s) there's one INFO-level
   `heartbeat` log: poll counts per source, RPC calls/minute and budget
-  usage, WebSocket active-connection and reconnect counts, and whether
-  the kill switch is halted. Silence between heartbeats now means "still
-  running," not "might have died three hours ago."
+  usage, WebSocket active-connection and reconnect counts, event-driven
+  discovery running totals (pool events seen/matched, second-wave
+  dispatched/expired/rejected), and whether the kill switch is halted.
+  Silence between heartbeats now means "still running," not "might have
+  died three hours ago."
 - `python run.py --radar-stats` shows InsiderRadar's last snapshot
   (wallets indexed, tokens tracked, buy/sell events seen) -- previously
   this state existed only in the running process's memory and the daily
@@ -556,20 +559,63 @@ WebSocket.
 
 ### Event-driven discovery + second-wave entry
 
-Discovery's primary path is no longer polling. `Orchestrator._check_pool_creation`
-runs on every transaction InsiderRadar's indexing subscription already
-fetches (Raydium AMM v4 + pump.fun's bonding curve, `logsSubscribe`) --
-zero extra RPC calls, since indexing was already fetching these
-transactions for wallet-activity parsing. `bot/pool_events.py` detects a
-pool-creation or token-launch instruction inside that same transaction
-(see its module docstring for exactly how, and the confidence level
-behind each piece -- Raydium's discriminator is verified against
-Raydium's own source, pump.fun's against pump.fun's own public docs, and
-mint resolution avoids guessing either program's account layout by
-leaning on the SPL Token Program's own reliably-parsed instructions
-instead). Detection-to-database latency is roughly one RPC round-trip
-after the transaction confirms -- realistically under ~1-2s, not a
-30-60s poll interval.
+Discovery's primary path is no longer polling, and (as of the log-content
+pre-filter below) no longer a random SAMPLE of traffic either.
+`Orchestrator._index_program_loop` subscribes to Raydium AMM v4 + pump.fun's
+bonding curve via `logsSubscribe`. Before ever calling getTransaction,
+`matches_creation_log_hint` (`bot/pool_events.py`) checks the notification's
+OWN log lines -- content `logsSubscribe` already delivers for free -- for a
+program-specific signal that this looks like a creation:
+
+- pump.fun's "create" is an Anchor instruction; Anchor's generated
+  dispatcher always logs `Program log: Instruction: Create` as the first
+  thing the handler does.
+- Raydium AMM v4 (not Anchor) has its own convention: every instruction
+  emits a base64 `ray_log: <...>` line whose first decoded byte is a
+  `LogType` discriminant; `Init` (0) covers pool initialization.
+
+Only a notification that already looks like a creation triggers a
+getTransaction fetch -- which then runs the SAME precise, byte-level
+`_matches_creation_instruction` + `resolve_new_mint` check this always
+had (see pool_events.py's module docstring for the confidence level
+behind each piece: Raydium's discriminator verified against Raydium's own
+source, pump.fun's against pump.fun's own public docs, mint resolution
+leaning on the SPL Token Program's reliably-parsed instructions instead
+of guessing either program's account layout). This two-stage design (free
+content pre-filter, then a precise byte-level confirmation once fetched)
+is what replaced randomly sampling a rate-capped ~60/min slice of ALL
+traffic (see "why the pre-filter exists" below for why that never worked).
+Detection-to-database latency is roughly one RPC round-trip after the
+transaction confirms -- realistically under ~1-2s, not a 30-60s poll
+interval.
+
+InsiderRadar's own indexing (wallet-activity parsing, unrelated to pool
+creation) still runs the original broad, rate-capped sample of ALL
+traffic -- that's a different, legitimate use case (a representative
+slice of real swap activity), and it still separately runs
+`_check_pool_creation` on whatever it fetches, as a zero-extra-cost
+fallback in case the log pre-filter above ever misses a genuine creation.
+A pre-filtered candidate is fetched through `Orchestrator._fetch_indexed_transaction`
+via a SEPARATE gate, `_candidate_fetch_skip_reason` -- it shares the
+safety-critical checks (kill switch, a genuine RPC outage's backoff, a
+disabled getTransaction, the overall RPC budget ceiling that protects
+TokenSafety/ExitMonitor) with the broad sample's `_indexing_skip_reason`,
+but deliberately skips the calls/min cap and its pacing sleep, since
+those exist only to bound the COST of blindly sampling ALL traffic, not
+to bound an already-rare, already-filtered candidate.
+
+**Why the pre-filter exists.** The original design fetched getTransaction
+for a rate-capped sample of ALL `logsSubscribe` traffic and decoded
+whatever came back. In production this measured `ws_pool_events_seen=244`,
+`ws_pool_events_matched=0`, and `indexing_skipped` climbing into the tens
+of thousands from the calls/min cap alone -- confirming that at real-world
+volumes (thousands of notifications/min for a busy program), a ~60/min
+random sample can statistically never be expected to land on a rare pool
+creation: the (tiny) probability a given notification is even sampled
+multiplies with the (tiny) probability a random notification is a
+creation. Checking log CONTENT costs nothing (it's already been
+delivered), so every notification can be checked, not just a random slice
+of them.
 
 **DexScreener polling is NOT disabled** -- it keeps running exactly as
 before, as the resilience backup: if the WS drops, a creation is missed
@@ -619,22 +665,29 @@ cycle-dependent (order of magnitude: thousands to tens of thousands/day
 network-wide in an active market; historically only a small fraction,
 commonly cited around 1-2%, ever "graduate" to Raydium). Raydium AMM v4's
 own direct (non-pump.fun) pool creations are smaller in count, plausibly
-low hundreds/day network-wide. None of that is what this bot will
-actually SEE: `indexing_max_calls_per_minute` (default 60) caps
-indexing's total getTransaction throughput regardless of how fast
-notifications arrive, and pump.fun's total on-chain transaction volume
-(mostly buys/sells, not creates) almost certainly exceeds what a free RPC
-tier can keep up with -- so `ws_pool_events_seen` is a SAMPLE of network
-activity, not a complete feed, and creation events specifically are a
-small fraction of even that sample. Realistic expectation: `ws_pool_events_matched`
-in the tens-to-low-hundreds/day range, with the number that actually
-survive second-wave filtering into a `second_wave_dispatch` likely
+low hundreds/day network-wide. `indexing_max_calls_per_minute` (default
+60) still caps the BROAD sample feeding InsiderRadar, but no longer caps
+pool-creation detection -- since the log pre-filter above, `ws_pool_events_seen`
+mostly reflects pre-filtered candidates (plus whatever fraction of the
+broad sample also happens to pass, now a redundant fallback), not a
+random slice of ALL traffic, so `ws_pool_events_matched` should track
+much closer to the real creation rate on the network, bounded mainly by
+WS delivery gaps (a drop/reconnect genuinely loses whatever the chain
+emitted during the gap -- see `RpcWebSocket`'s docstring) rather than by
+indexing's own sampling. Realistic expectation once the pre-filter is
+confirmed working: `ws_pool_events_matched` tracking Raydium/pump.fun's
+actual creation rate above, with the number that actually survives
+second-wave filtering into a `second_wave_dispatch` still likely
 comparable to or smaller than DexScreener's current volume (single digits
-to low tens/day). If `ws_pool_events_seen` stays at zero for an extended
-stretch while the bot is otherwise healthy, that's the WS subscription
-itself not receiving traffic (check `ws_active_connections`/
-`ws_total_reconnects` in the same heartbeat line) -- not a filtering
-problem.
+to low tens/day) -- second-wave's own liquidity/retention filtering is
+the bigger funnel narrowing after this point, not detection coverage. If
+`ws_pool_events_seen` stays near zero for an extended stretch while the
+bot is otherwise healthy, that's either the WS subscription not receiving
+traffic at all (check `ws_active_connections`/`ws_total_reconnects` in
+the same heartbeat line) or the log pre-filter itself not matching --
+`pool_event_checked` (temporary, see orchestrator.py's `_check_pool_creation`)
+logs the program and match result for every transaction actually fetched,
+which is the fastest way to tell the two apart.
 
 ---
 

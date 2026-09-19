@@ -39,6 +39,7 @@ Confidence levels, stated plainly rather than implied:
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 from dataclasses import dataclass
 from typing import Optional
@@ -64,6 +65,83 @@ def anchor_discriminator(instruction_name: str) -> bytes:
 # is index 1 -- see this module's docstring for the confidence note.
 RAYDIUM_INITIALIZE2_DISCRIMINATOR = bytes([1])
 PUMPFUN_CREATE_DISCRIMINATOR = anchor_discriminator("create")
+
+# --- free, pre-getTransaction log-content pre-filter ---
+#
+# The original design fetched getTransaction for a rate-capped SAMPLE of
+# ALL logsSubscribe traffic (indexing_max_calls_per_minute, default
+# 60/min) and ran _matches_creation_instruction against whatever came
+# back. That's fine for InsiderRadar's purpose (a representative sample of
+# swap activity), but pool creations are a small fraction of a busy
+# program's total traffic -- confirmed in production at
+# ws_pool_events_seen=244, ws_pool_events_matched=0 after tens of
+# thousands of notifications, with indexing_skipped climbing into the tens
+# of thousands from the calls/min cap alone. At real-world volumes
+# (thousands/min network-wide), a ~60/min random sample can statistically
+# never be expected to land on a rare event: the two probabilities
+# multiply (chance a given notification is even sampled) x (chance a
+# random notification is a creation), and the first factor alone is
+# already on the order of 1% or less.
+#
+# The fix: a pool-creation instruction is not silent BEFORE any RPC call
+# is made -- logsSubscribe's own notification already carries the
+# program's on-chain log lines for free (that's the entire point of
+# "logs"Subscribe). Both programs here log something distinctive for
+# their creation instruction specifically, verified against real,
+# independent sources rather than assumed:
+#
+# - pump.fun's "create" is an Anchor instruction. Anchor's generated
+#   dispatcher unconditionally logs "Program log: Instruction: <Name>"
+#   (PascalCase) as the very first thing an instruction handler does --
+#   see https://docs.chainstack.com/docs/solana-listening-to-pumpfun-token-mint-using-only-logssubscribe,
+#   which documents using exactly "Program log: Instruction: Create" to
+#   detect pump.fun launches via logsSubscribe ALONE, with no
+#   getTransaction call at all.
+# - Raydium AMM v4 predates Anchor and has its own logging convention
+#   instead: raydium-amm/program/src/log.rs's encode_ray_log emits
+#   "ray_log: <base64>" for every instruction, where the base64-decoded
+#   payload's FIRST byte is a LogType discriminant (Init=0, Deposit=1,
+#   Withdraw=2, SwapBaseIn=3, SwapBaseOut=4) -- confirmed directly against
+#   that file's source. LogType::Init covers pool initialization (the
+#   legacy Initialize AND Initialize2), which is exactly what
+#   _matches_creation_instruction below goes on to narrow down precisely
+#   once the transaction is actually fetched.
+#
+# A False here means "not worth fetching" -- indistinguishable in effect
+# from the old design simply not having sampled this notification. A
+# False POSITIVE (log content looked promising but
+# _matches_creation_instruction later disagrees) costs exactly one
+# ordinary getTransaction call that correctly finds no match -- never a
+# correctness problem, since dispatch still requires
+# _matches_creation_instruction + resolve_new_mint to both succeed on the
+# real, fetched transaction. This function only decides what's worth
+# fetching in the first place.
+PUMPFUN_CREATE_LOG_SUBSTRING = "Instruction: Create"
+_RAY_LOG_MARKER = "ray_log: "
+_RAYDIUM_INIT_LOG_TYPE = 0
+
+
+def matches_creation_log_hint(logs: list[str], program_id: str) -> bool:
+    """True if `logs` (a logsSubscribe notification's own log lines --
+    see Orchestrator._index_program_loop) already look like a creation
+    for `program_id`, with zero RPC calls made to decide this."""
+    if program_id == PUMPFUN_BONDING_CURVE_PROGRAM_ID:
+        return any(PUMPFUN_CREATE_LOG_SUBSTRING in line for line in logs)
+    if program_id == RAYDIUM_AMM_V4_PROGRAM_ID:
+        for line in logs:
+            marker_at = line.find(_RAY_LOG_MARKER)
+            if marker_at == -1:
+                continue
+            payload = line[marker_at + len(_RAY_LOG_MARKER):].strip()
+            try:
+                decoded = base64.b64decode(payload, validate=False)
+            except ValueError:
+                continue
+            if decoded and decoded[0] == _RAYDIUM_INIT_LOG_TYPE:
+                return True
+        return False
+    return False
+
 
 _DISCRIMINATORS = {
     RAYDIUM_AMM_V4_PROGRAM_ID: RAYDIUM_INITIALIZE2_DISCRIMINATOR,

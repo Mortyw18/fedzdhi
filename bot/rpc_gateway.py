@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -43,15 +44,24 @@ class RpcRateLimited(RpcError):
 class RpcMethodDisabled(RpcOutage):
     """A method looks PERMANENTLY rejected, not transiently failing: a 403
     from the provider, or a JSON-RPC error whose code/message says the
-    method isn't available (e.g. "not supported on this plan"). Retrying
-    this is pointless until the provider config changes -- RpcGateway
-    remembers it for the rest of the process and every subsequent call to
-    that method fails instantly, with zero network I/O, instead of paying
-    a full retry/backoff cycle on every single call forever. Subclasses
-    RpcOutage so existing `except RpcOutage:` call sites keep working
-    unchanged; callers that need to react differently (see Orchestrator's
-    indexing loop, which stops trying the method at all rather than
-    continuing to log a failure every time) can catch this specifically.
+    method isn't available (e.g. "not supported on this plan"), confirmed
+    RpcGateway.method_disable_threshold separate times (not retries of one
+    request -- separate call() invocations) before this is ever raised.
+    A single 403 is deliberately NOT enough: it can just as easily be a
+    transient WAF/proxy block or an unrelated hiccup as a genuine plan
+    restriction, and disabling a method for the rest of the run on one bad
+    response was a real bug in an earlier version of this (getTransaction,
+    an utterly ordinary method no free tier actually restricts, got
+    permanently killed by a single non-representative 403). Once actually
+    confirmed, retrying is pointless until the provider config changes --
+    RpcGateway remembers it for the rest of the process and every
+    subsequent call to that method fails instantly, with zero network I/O.
+    Subclasses RpcOutage so existing `except RpcOutage:` call sites keep
+    working unchanged; callers that need to react differently (see
+    Orchestrator's indexing loop, which stops trying the method at all
+    rather than continuing to log a failure every time) can catch this
+    specifically. See also `call()`'s `allow_method_disable` parameter for
+    opting a call site out of this mechanism entirely.
     """
 
 
@@ -61,16 +71,86 @@ class _MethodUnavailable(RpcError):
     the caller-visible RpcMethodDisabled. Never escapes _post/call."""
 
 
+# Solana's JSON-RPC error code for "this transaction's version is higher
+# than what maxSupportedTransactionVersion in the request allowed" -- e.g.
+# {"code": -32015, "message": "Transaction version (1) is not supported by
+# the requesting client. Please try the request again with the following
+# configuration parameter: \"maxSupportedTransactionVersion\": 1"}.
+# Checked and handled BEFORE _looks_like_method_unavailable below: that
+# message contains "not supported," which the plan-gating heuristic would
+# otherwise match, misreading "this one request needs a version bump" as
+# "this method looks permanently unavailable on this plan" -- exactly the
+# misdiagnosis that cost a production run its entire event-driven discovery
+# funnel (getTransaction 3-strike-disabled while the real cause was every
+# versioned transaction on-chain having moved past the hardcoded cap).
+_TRANSACTION_VERSION_NOT_SUPPORTED_CODE = -32015
+
+
+class _TransactionVersionTooLow(RpcError):
+    """Internal signal raised by _post when maxSupportedTransactionVersion
+    in the request was lower than the transaction's actual version --
+    never a permanent rejection, always fixable by resending with a higher
+    value. Caught inside call(), which bumps
+    RpcGateway.max_supported_transaction_version and retries the same
+    request in place. Never escapes _post/call."""
+
+    def __init__(self, required_version: int, message: str) -> None:
+        super().__init__(message)
+        self.required_version = required_version
+
+
+def _parse_required_transaction_version(message: str) -> Optional[int]:
+    """Pulls the version number Solana's -32015 error says the client
+    needs to request, straight out of the (freeform, provider-authored)
+    error message -- e.g. '...following configuration parameter:
+    "maxSupportedTransactionVersion": 1' or '...Transaction version (1) is
+    not supported...'. Returns None if the message doesn't match either
+    known shape, so the caller can fall back to a conservative +1 bump
+    rather than silently doing nothing.
+    """
+    match = re.search(r"maxSupportedTransactionVersion[\"']?\s*:\s*(\d+)", message)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"[Vv]ersion\s*\((\d+)\)", message)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _patch_max_supported_transaction_version(params: Optional[list], new_version: int) -> bool:
+    """Mutates any {"maxSupportedTransactionVersion": ...} entry inside a
+    JSON-RPC params list IN PLACE, so the exact payload dict already built
+    for this call is what actually gets resent -- the call site that built
+    `params` never needs to know a bump happened. Returns whether anything
+    was actually found and patched: a method whose call site never set
+    this key can't be helped by bumping it, and the caller uses this to
+    decide whether retrying is even worth attempting again.
+    """
+    if not params:
+        return False
+    patched = False
+    for element in params:
+        if isinstance(element, dict) and "maxSupportedTransactionVersion" in element:
+            element["maxSupportedTransactionVersion"] = new_version
+            patched = True
+    return patched
+
+
 def _looks_like_method_unavailable(error: Any) -> bool:
     """Heuristic over a JSON-RPC error object: does this look like "this
     method isn't available to you," not an ordinary transient failure?
     JSON-RPC code -32601 is the standard "Method not found." The message
     substrings cover what free-tier providers commonly say instead of a
-    clean error code when a method is plan-gated. False positives here
-    just mean a few retries are skipped early -- not silent -- since
-    rpc_method_disabled is always logged; false negatives just mean the
-    old (safe, if wasteful) retry-forever behavior for that one message
-    shape, so this is intentionally over-inclusive rather than exact.
+    clean error code when a method is plan-gated. A single match is
+    deliberately NOT enough to disable a method on its own -- see
+    RpcGateway.method_disable_threshold -- so a false positive here costs
+    a few logged-but-otherwise-ordinary transient failures, not a
+    permanently killed method; a false negative just means the old (safe,
+    if wasteful) retry-forever behavior for that one message shape. This
+    is intentionally over-inclusive rather than exact, since the sustained
+    threshold is what actually guards against acting on a one-off match.
+    Code -32015 (see _TRANSACTION_VERSION_NOT_SUPPORTED_CODE) is handled
+    entirely separately, upstream of this check, and must never reach here.
     """
     if not isinstance(error, dict):
         return False
@@ -137,6 +217,7 @@ class RpcGateway:
         rate_limit_base_backoff_s: float = 2.0,
         rate_limit_max_backoff_s: float = 60.0,
         logger: Optional[logging.Logger] = None,
+        max_supported_transaction_version: int = 1,
     ) -> None:
         self.primary_url = primary_url
         self.failover_url = failover_url
@@ -145,6 +226,18 @@ class RpcGateway:
         self.session = session or requests.Session()
         self.logger = logger or logging.getLogger("memebot.rpc_gateway")
         self._consecutive_failures = 0
+
+        # The highest Solana transaction version call sites that fetch
+        # transactions (indexing's getTransaction, ExecutionEngine's own
+        # swap confirmation) should ask for. Mutable and shared: call sites
+        # read this live (not a hardcoded literal) so an auto-bump below
+        # takes effect for every future call, not just the one that
+        # triggered it. Defaults to 1 -- version 0 was the original
+        # versioned-transaction format; version 1 (and whatever comes
+        # after) is handled the same way by _post_with_auto_version_bump
+        # the moment the chain moves again, without needing a code change.
+        self.max_supported_transaction_version = max_supported_transaction_version
+        self._max_version_autobumps = 5
 
         # Shared, gateway-wide backoff: a 429 anywhere sets a cooldown that
         # EVERY subsequent call (from any code path, any thread) checks and
@@ -163,7 +256,33 @@ class RpcGateway:
         # method fails instantly, with zero network I/O, instead of paying
         # a full retry cycle every single time it's called for the rest of
         # the run.
+        #
+        # A single 403 is NOT enough to disable a method -- it used to be,
+        # and that was a real bug: a 403 can mean a genuinely plan-gated
+        # method, but it can just as easily mean a transient WAF/proxy
+        # block, an IP-level hiccup, or anything else with no relation to
+        # "this method is permanently unavailable." One bad response used
+        # to permanently kill a method (getTransaction, in one observed
+        # case -- an utterly ordinary method no free tier actually
+        # restricts) for the rest of the run on the first blip, the exact
+        # same false-positive shape the RPC-outage kill switch and the
+        # indexing backoff both had to fix earlier by requiring sustained
+        # failures before acting. method_disable_threshold consecutive
+        # _MethodUnavailable signals for the SAME method (across separate
+        # call() invocations, e.g. different getTransaction signatures --
+        # not retries of the same request) are required before the method
+        # is actually disabled; short of that, it's treated as an ordinary
+        # transient failure (RpcOutage as usual) and the count keeps
+        # accumulating across calls.
+        #
+        # Deliberately NOT persisted to disk anywhere (unlike KillSwitch's
+        # state -- see kill_switch.py): this is a fresh, empty set every
+        # time a RpcGateway is constructed, and Orchestrator constructs a
+        # brand new one on every process start. A disabled-for-this-run
+        # method never survives a restart; there is no state file to clear.
         self._disabled_methods: set[str] = set()
+        self._method_unavailable_counts: Counter[str] = Counter()
+        self.method_disable_threshold = 3
 
         # Per-method call counters, for the RPC budget audit in the daily
         # report. Every attempted HTTP request counts, including retries --
@@ -220,9 +339,61 @@ class RpcGateway:
             raise _MethodUnavailable(f"403 Forbidden from {url}")
         resp.raise_for_status()
         data = resp.json()
-        if "error" in data and _looks_like_method_unavailable(data["error"]):
-            raise _MethodUnavailable(f"{payload['method']} RPC error: {data['error']}")
+        if "error" in data:
+            error = data["error"]
+            if isinstance(error, dict) and error.get("code") == _TRANSACTION_VERSION_NOT_SUPPORTED_CODE:
+                message = str(error.get("message", ""))
+                required = _parse_required_transaction_version(message)
+                if required is None:
+                    required = self.max_supported_transaction_version + 1
+                raise _TransactionVersionTooLow(required, message)
+            if _looks_like_method_unavailable(error):
+                raise _MethodUnavailable(f"{payload['method']} RPC error: {error}")
         return data
+
+    def _post_with_auto_version_bump(self, url: str, payload: dict, method: str) -> dict:
+        """Wraps _post so a -32015 "transaction version not supported"
+        response self-heals within this one call() attempt: bump
+        max_supported_transaction_version to whatever the error says the
+        client needs, patch it into this exact payload's params, and
+        re-issue the SAME request -- instead of surfacing it as an
+        ordinary failure that indexing's backoff or the disable-threshold
+        machinery (neither of which knows anything about transaction
+        versions) would otherwise have to absorb blindly, run after run,
+        forever, every time the chain's default version format changes.
+        Bounded so a provider that keeps demanding a higher version every
+        single response can't spin this forever.
+        """
+        for _ in range(self._max_version_autobumps + 1):
+            try:
+                return self._post(url, payload)
+            except _TransactionVersionTooLow as exc:
+                old = self.max_supported_transaction_version
+                new = max(old + 1, exc.required_version)
+                self.max_supported_transaction_version = new
+                patched = _patch_max_supported_transaction_version(payload.get("params"), new)
+                self.logger.warning(
+                    "rpc_transaction_version_bumped",
+                    extra={
+                        "fields": {
+                            "method": method, "old_version": old, "new_version": new,
+                            "params_patched": patched, "detail": str(exc),
+                        }
+                    },
+                )
+                self._record_call(method)
+                self.budget.record_and_check()
+                if not patched:
+                    # Nothing in this request's params names the key --
+                    # bumping the instance-wide default can't fix THIS
+                    # call, so don't loop pointlessly; let it surface as an
+                    # ordinary error instead.
+                    raise RpcError(f"{method}: transaction version {exc.required_version} not supported, "
+                                    f"and no maxSupportedTransactionVersion param present to patch: {exc}") from exc
+        raise RpcOutage(
+            f"{method}: transaction version requirement kept increasing past "
+            f"{self._max_version_autobumps} auto-bumps -- giving up on this call"
+        )
 
     def _trip_rate_limit_cooldown(self, method: str, exc: Exception) -> None:
         self._rate_limit_backoff_level += 1
@@ -236,7 +407,13 @@ class RpcGateway:
             extra={"fields": {"method": method, "backoff_s": backoff, "level": self._rate_limit_backoff_level, "detail": str(exc)}},
         )
 
-    def call(self, method: str, params: Optional[list] = None, max_retries: Optional[int] = None) -> Any:
+    def call(
+        self,
+        method: str,
+        params: Optional[list] = None,
+        max_retries: Optional[int] = None,
+        allow_method_disable: bool = True,
+    ) -> Any:
         """JSON-RPC call with retry/backoff, then failover, then RpcOutage.
 
         A 429 is never retried immediately: it trips a shared cooldown (see
@@ -256,10 +433,22 @@ class RpcGateway:
         retrying on a fixed ~1-2s schedule from the logs alone.
 
         A method that looks PERMANENTLY rejected (403, or a JSON-RPC error
-        that reads like "not available on this plan") is never retried at
-        all, on any URL or attempt -- see RpcMethodDisabled.
+        that reads like "not available on this plan") needs
+        method_disable_threshold sustained confirmations (see __init__)
+        before it's actually disabled -- see RpcMethodDisabled. Until then
+        it's treated as an ordinary transient failure.
+
+        `allow_method_disable=False` opts a call site out of the
+        disable mechanism entirely, always surfacing RpcOutage instead of
+        ever raising RpcMethodDisabled -- Orchestrator's indexing loop
+        passes this for getTransaction: it's such a fundamental,
+        universally-available method that treating any rejection of it as
+        "permanently unavailable on this plan" was mis-scoped to begin
+        with, and indexing already has its own dedicated, sustained-failure
+        backoff (see _index_program_loop) that handles a real outage on
+        this specific call site without needing this mechanism too.
         """
-        if method in self._disabled_methods:
+        if allow_method_disable and method in self._disabled_methods:
             raise RpcMethodDisabled(f"{method} was disabled earlier this run (looked permanently rejected) -- not retrying")
 
         effective_max_retries = self.max_retries if max_retries is None else max_retries
@@ -272,17 +461,54 @@ class RpcGateway:
                 self._record_call(method)
                 self.budget.record_and_check()
                 try:
-                    data = self._post(url, payload)
+                    data = self._post_with_auto_version_bump(url, payload, method)
                     if "error" in data:
                         raise RpcError(f"{method} RPC error: {data['error']}")
                     self._consecutive_failures = 0
                     self._rate_limit_backoff_level = 0
                     self._cooldown_until = 0.0
+                    self._method_unavailable_counts[method] = 0
                     return data.get("result")
                 except _MethodUnavailable as exc:
-                    self._disabled_methods.add(method)
-                    self.logger.error("rpc_method_disabled", extra={"fields": {"method": method, "detail": str(exc)}})
-                    raise RpcMethodDisabled(f"{method} permanently disabled this run: {exc}") from exc
+                    last_exc = exc
+                    self._consecutive_failures += 1
+                    if not allow_method_disable:
+                        self.logger.warning(
+                            "rpc_method_rejection_ignored",
+                            extra={"fields": {"method": method, "params": params, "detail": str(exc)}},
+                        )
+                        if attempt < effective_max_retries - 1:
+                            time.sleep(min(2 ** attempt * 0.5, 4.0))
+                        continue
+                    self._method_unavailable_counts[method] += 1
+                    count = self._method_unavailable_counts[method]
+                    if count >= self.method_disable_threshold:
+                        self._disabled_methods.add(method)
+                        self.logger.error(
+                            "rpc_method_disabled",
+                            extra={"fields": {"method": method, "params": params, "detail": str(exc), "confirmations": count}},
+                        )
+                        raise RpcMethodDisabled(
+                            f"{method} permanently disabled this run after {count} sustained rejections: {exc}"
+                        ) from exc
+                    # `params` included here on purpose: the earlier version
+                    # of this warning only logged the error message, which
+                    # meant confirming what the OUTGOING request actually
+                    # contained (e.g. whether maxSupportedTransactionVersion
+                    # was really being sent) required reproducing the call
+                    # by hand against the provider directly. It's now right
+                    # here in the log line instead.
+                    self.logger.warning(
+                        "rpc_method_possibly_unavailable",
+                        extra={
+                            "fields": {
+                                "method": method, "params": params, "detail": str(exc), "confirmations": count,
+                                "threshold": self.method_disable_threshold,
+                            }
+                        },
+                    )
+                    if attempt < effective_max_retries - 1:
+                        time.sleep(min(2 ** attempt * 0.5, 4.0))
                 except RpcRateLimited as exc:
                     last_exc = exc
                     self._consecutive_failures += 1
