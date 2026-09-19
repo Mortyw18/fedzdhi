@@ -13,7 +13,7 @@ import asyncio
 import logging
 import signal
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -213,6 +213,7 @@ class Orchestrator:
         # _check_pool_creation / _second_wave_loop / config.py's
         # "event-driven discovery + second-wave entry" section.
         self._pending_second_wave: dict[str, _PendingPool] = {}
+        self._ws_raw_log_samples: Counter[str] = Counter()  # per program, capped by ws_raw_log_sample_count
         self._pool_events_seen = 0          # every notification actually checked (post RPC-budget throttling)
         self._pool_events_matched = 0       # of those, matched a creation/launch instruction with a resolved mint
         self._second_wave_dispatched_count = 0
@@ -784,6 +785,29 @@ class Orchestrator:
             signature = value.get("signature")
             if not signature:
                 continue
+            logs = value.get("logs") or []
+
+            # Ground truth for "is the matcher's view of reality correct":
+            # dumps the first few notifications per program exactly as they
+            # arrived, next to what the pre-filter concluded about them.
+            # Without this, a matcher that silently never fires is
+            # indistinguishable from a stream that never carries a
+            # creation -- the two need completely different fixes.
+            if self._ws_raw_log_samples[program_id] < self.config.ws_raw_log_sample_count:
+                self._ws_raw_log_samples[program_id] += 1
+                self.logger.info(
+                    "ws_raw_log_sample",
+                    extra={
+                        "fields": {
+                            "program": INDEXED_PROGRAM_IDS.get(program_id, program_id),
+                            "sample": self._ws_raw_log_samples[program_id],
+                            "signature": signature,
+                            "log_line_count": len(logs),
+                            "hint_matched": matches_creation_log_hint(logs, program_id),
+                            "logs": [line[:180] for line in logs[:40]],
+                        }
+                    },
+                )
 
             # --- free pre-filter: pool-creation candidates bypass the
             # blind-sampling throttle entirely, since checking the
@@ -793,7 +817,7 @@ class Orchestrator:
             # traffic per minute" design could statistically never catch a
             # rare pool-creation event once real traffic (thousands/min)
             # exceeded that sample by orders of magnitude.
-            if self.config.enable_event_driven_discovery and matches_creation_log_hint(value.get("logs") or [], program_id):
+            if self.config.enable_event_driven_discovery and matches_creation_log_hint(logs, program_id):
                 skip_reason = self._candidate_fetch_skip_reason()
                 if skip_reason is not None:
                     self._indexing_skipped_count += 1
@@ -879,7 +903,9 @@ class Orchestrator:
         while not self.stop_event.is_set():
             await asyncio.sleep(self.config.heartbeat_interval_s)
             rpc_stats = self.rpc.get_call_stats()
-            ws_stats = self._ws.get_ws_stats() if self._ws is not None else {"active_connections": 0, "total_reconnects": 0, "last_drop_at": None}
+            ws_stats = self._ws.get_ws_stats() if self._ws is not None else {
+                "active_connections": 0, "total_reconnects": 0, "last_drop_at": None, "dropped_notifications": 0,
+            }
             self.logger.info(
                 "heartbeat",
                 extra={
@@ -892,6 +918,10 @@ class Orchestrator:
                         "rpc_total_calls": rpc_stats["total_calls"],
                         "ws_active_connections": ws_stats["active_connections"],
                         "ws_total_reconnects": ws_stats["total_reconnects"],
+                        # Non-zero means the consumer fell behind the
+                        # firehose and lost coverage -- bounded and
+                        # counted, rather than losing the connection.
+                        "ws_dropped_notifications": ws_stats["dropped_notifications"],
                         "kill_switch_halted": self.kill_switch.is_halted(),
                         "open_positions": len(self.open_positions),
                         "indexing_skipped": self._indexing_skipped_count,

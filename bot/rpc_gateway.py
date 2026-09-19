@@ -598,6 +598,29 @@ class RpcGateway:
         return False
 
 
+def _subscription_label(params: list) -> str:
+    """A short, human-readable identifier for WHICH subscription a log
+    line is about -- one RpcWebSocket runs several concurrently, so
+    "ws_disconnected" without this is ambiguous about which stream died."""
+    for entry in params:
+        if isinstance(entry, str):
+            return entry
+        if isinstance(entry, dict):
+            mentions = entry.get("mentions")
+            if isinstance(mentions, list) and mentions:
+                return str(mentions[0])
+    return "unknown"
+
+
+class _StreamEnded:
+    """Internal end-of-stream marker passed from the drain task to the
+    consumer through the same queue as notifications, so the consumer sees
+    "socket died, here's why" in order rather than out of band."""
+
+    def __init__(self, exc: Optional[BaseException]) -> None:
+        self.exc = exc
+
+
 class RpcWebSocket:
     """Async wrapper over Helius WebSocket logsSubscribe/accountSubscribe.
 
@@ -616,9 +639,32 @@ class RpcWebSocket:
     inherent coverage hole in InsiderRadar's indexing (not a bug fixable
     here) -- total_reconnects/last_drop_at in get_ws_stats() and the
     heartbeat log are what make it visible rather than silent.
+
+    **The socket is drained by a dedicated task, never by the consumer.**
+    subscribe() used to yield directly out of `async for raw in ws`, which
+    meant the socket was only read as fast as the CONSUMER processed
+    notifications. For a firehose subscription (Raydium AMM v4 and
+    pump.fun's bonding curve are two of the busiest programs on Solana,
+    hundreds of notifications/sec) whose consumer does an `await`ed
+    getTransaction per interesting event, that is a guaranteed slow
+    consumer: the websockets library's inbound queue fills, it stops
+    reading the TCP socket to apply backpressure, and the server drops the
+    connection. That is what "ws_active_connections: 0 with
+    ws_total_reconnects climbing" looked like in production -- not a
+    connection-count limit, and not an auth problem, just a stalled
+    reader. Now a drain task reads the socket continuously into a bounded
+    queue and DROPS THE OLDEST notification when the consumer falls
+    behind, so falling behind costs coverage (counted in
+    dropped_notifications, surfaced in the heartbeat) instead of costing
+    the whole connection.
     """
 
-    def __init__(self, ws_url: str, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        ws_url: str,
+        logger: Optional[logging.Logger] = None,
+        max_buffered_notifications: int = 2048,
+    ) -> None:
         self.ws_url = ws_url
         self.logger = logger or logging.getLogger("memebot.rpc_ws")
         # Aggregate across every concurrent subscribe() call this instance
@@ -629,20 +675,74 @@ class RpcWebSocket:
         self.active_connections = 0
         self.total_reconnects = 0
         self.last_drop_at: Optional[float] = None
+        # How many notifications were read off the socket but thrown away
+        # because the consumer was still busy. Non-zero means real coverage
+        # loss -- but bounded, visible loss, instead of a dropped
+        # connection that loses everything until it reconnects.
+        self.dropped_notifications = 0
+        self.max_buffered_notifications = max_buffered_notifications
 
     def get_ws_stats(self) -> dict:
         return {
             "active_connections": self.active_connections,
             "total_reconnects": self.total_reconnects,
             "last_drop_at": self.last_drop_at,
+            "dropped_notifications": self.dropped_notifications,
         }
+
+    @staticmethod
+    def _decode_notification(raw: str) -> Optional[dict]:
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        params = msg.get("params")
+        if isinstance(params, dict) and "result" in params:
+            return params["result"]
+        return None
+
+    def _offer(self, queue: "asyncio.Queue", item: Any) -> None:
+        """Never blocks: makes room by discarding the OLDEST pending item.
+
+        Blocking here would defeat the entire point of the drain task --
+        it would reintroduce exactly the consumer-driven backpressure that
+        was killing the connection.
+        """
+        if queue.full():
+            try:
+                queue.get_nowait()
+                self.dropped_notifications += 1
+            except asyncio.QueueEmpty:  # pragma: no cover -- racy only under multiple consumers
+                pass
+        queue.put_nowait(item)
+
+    async def _drain_socket(self, ws: Any, queue: "asyncio.Queue") -> None:
+        """Read the socket as fast as it delivers, independent of the
+        consumer, and signal end-of-stream (with the cause) exactly once."""
+        try:
+            async for raw in ws:
+                payload = self._decode_notification(raw)
+                if payload is not None:
+                    self._offer(queue, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- reraised in the consumer, which owns reconnect policy
+            self._offer(queue, _StreamEnded(exc))
+            return
+        self._offer(queue, _StreamEnded(None))
 
     async def subscribe(
         self, method: str, params: list, max_reconnects: int = 1_000_000
     ) -> AsyncIterator[dict]:
         """Yield notification `params.result` payloads forever, reconnecting on drop."""
         attempt = 0
+        label = _subscription_label(params)
         while attempt < max_reconnects:
+            ws = None
+            drain: Optional[asyncio.Task] = None
+            connected_at = 0.0
+            received = 0
+            dropped_at_connect = self.dropped_notifications
             try:
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as ws:
                     sub_request = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -651,21 +751,69 @@ class RpcWebSocket:
                     if "error" in ack:
                         raise RpcError(f"subscribe {method} failed: {ack['error']}")
                     attempt = 0  # reset backoff after a clean connect
+                    connected_at = time.monotonic()
                     self.active_connections += 1
+                    self.logger.info(
+                        "ws_connected",
+                        extra={
+                            "fields": {
+                                "method": method,
+                                "subscription": label,
+                                "subscription_id": ack.get("result"),
+                                "active_connections": self.active_connections,
+                                "buffer_size": self.max_buffered_notifications,
+                            }
+                        },
+                    )
+                    queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_buffered_notifications)
+                    drain = asyncio.create_task(self._drain_socket(ws, queue))
                     try:
-                        async for raw in ws:
-                            msg = json.loads(raw)
-                            if "params" in msg and "result" in msg["params"]:
-                                yield msg["params"]["result"]
+                        while True:
+                            item = await queue.get()
+                            if isinstance(item, _StreamEnded):
+                                if item.exc is not None:
+                                    raise item.exc
+                                raise RpcError(f"{method} stream closed by server")
+                            received += 1
+                            yield item
                     finally:
                         self.active_connections -= 1
+                        if drain is not None:
+                            drain.cancel()
             except (websockets.exceptions.WebSocketException, OSError, RpcError) as exc:
                 attempt += 1
                 self.total_reconnects += 1
                 self.last_drop_at = time.time()
                 delay = min(2 ** attempt, 30)
-                self.logger.warning("ws subscribe %s dropped (%s), reconnecting in %ss", method, exc, delay)
+                self.logger.warning(
+                    "ws_disconnected",
+                    extra={
+                        "fields": {
+                            "method": method,
+                            "subscription": label,
+                            "reason": f"{type(exc).__name__}: {exc}",
+                            # Populated by the websockets library once the
+                            # close handshake completes -- 1000/1001 is a
+                            # clean server-side close, 1006 an abrupt drop,
+                            # 1008/1011 a policy or server error. This is
+                            # the field that distinguishes "Helius hung up
+                            # on us deliberately" from "the TCP connection
+                            # just died".
+                            "close_code": getattr(ws, "close_code", None),
+                            "close_reason": getattr(ws, "close_reason", None),
+                            "connection_uptime_s": round(time.monotonic() - connected_at, 1) if connected_at else 0.0,
+                            "notifications_received": received,
+                            "notifications_dropped_this_connection": self.dropped_notifications - dropped_at_connect,
+                            "reconnect_attempt": attempt,
+                            "retry_in_s": delay,
+                        }
+                    },
+                )
                 await asyncio.sleep(delay)
+                self.logger.info(
+                    "ws_reconnecting",
+                    extra={"fields": {"method": method, "subscription": label, "attempt": attempt}},
+                )
 
     def logs_subscribe(self, mentions_address: str) -> AsyncIterator[dict]:
         return self.subscribe(

@@ -574,6 +574,20 @@ program-specific signal that this looks like a creation:
   emits a base64 `ray_log: <...>` line whose first decoded byte is a
   `LogType` discriminant; `Init` (0) covers pool initialization.
 
+**Only lines the subscribed program itself emitted count.** A
+`logsSubscribe` filtered on `mentions: [<program>]` delivers the WHOLE
+transaction's logs, including every other program invoked in it, so
+`attributed_log_lines` replays Solana's `invoke`/`success` bracketing to
+track the call stack and attribute each line to its actual emitter. This
+is load-bearing, not fussiness: the SPL Associated Token Account program
+logs `Program log: Instruction: Create` — byte-identical to pump.fun's —
+when it creates a buyer's token account, which nearly every pump.fun BUY
+does. The first version of this pre-filter matched a bare substring and
+therefore fired on a large share of ordinary buy traffic (~5
+fetches/sec, all correctly rejected downstream as `matched: false`).
+Exact-string comparison alone does not fix that, because the two lines
+are identical — only knowing who emitted it separates them.
+
 Only a notification that already looks like a creation triggers a
 getTransaction fetch -- which then runs the SAME precise, byte-level
 `_matches_creation_instruction` + `resolve_new_mint` check this always
@@ -687,7 +701,27 @@ traffic at all (check `ws_active_connections`/`ws_total_reconnects` in
 the same heartbeat line) or the log pre-filter itself not matching --
 `pool_event_checked` (temporary, see orchestrator.py's `_check_pool_creation`)
 logs the program and match result for every transaction actually fetched,
-which is the fastest way to tell the two apart.
+and `ws_raw_log_sample` dumps the first `ws_raw_log_sample_count`
+(default 5) notifications per program verbatim with the pre-filter's
+verdict attached -- between them, the fastest way to tell the two apart.
+`tools/verify_pool_detection.py` goes further and runs both stages
+against REAL mainnet transactions using your own RPC key
+(`python3 tools/verify_pool_detection.py --scan pumpfun`), which is the
+only check that can prove the log shapes this depends on still match what
+the chain actually emits.
+
+**WebSocket health.** `ws_active_connections` near 0 with
+`ws_total_reconnects` climbing means the subscription is flapping. The
+cause this bot hit was a slow consumer, not a connection limit: the
+socket used to be read only as fast as notifications were processed, so
+one `await`ed getTransaction per interesting event was enough to stall
+the reader on a firehose subscription until the server hung up. The
+socket is now drained by a dedicated task into a bounded queue that drops
+the OLDEST notification on overflow, so falling behind costs bounded,
+counted coverage (`ws_dropped_notifications` in the heartbeat) instead of
+the connection. Every disconnect logs `ws_disconnected` with the reason,
+close code, connection uptime, and how many notifications that connection
+delivered; every retry logs `ws_reconnecting`.
 
 ---
 

@@ -196,6 +196,25 @@ separately runs continues to also check every transaction it fetches
 through the same byte-level `detect_pool_creation`, as a fallback that
 doesn't depend on the log pre-filter's assumptions holding.
 
+**It has already been wrong once, in the loose direction.** The first
+version matched a bare substring across the notification's whole log
+list. Because `logsSubscribe` delivers every program's logs for the whole
+transaction, and because the SPL Associated Token Account program emits a
+`Program log: Instruction: Create` line byte-identical to pump.fun's, it
+fired on a large share of ordinary pump.fun BUY traffic (~5 fetches/sec).
+Detection itself stayed correct -- the byte-level discriminator rejected
+every one of them -- but the wasted fetch rate was enough to stall the
+WebSocket consumer and cause repeated server-side disconnects. It now
+attributes each log line to the program that actually emitted it. The
+lesson worth keeping: a pre-filter being cheap per event doesn't make it
+free, and a matcher that is never *wrong* can still be badly *loose*.
+
+None of these log-format assumptions have been confirmed against live
+mainnet traffic from inside the test suite -- every fixture there is
+synthetic, built from documented shapes. `tools/verify_pool_detection.py`
+runs both stages against real transactions using a real RPC key, and
+running it is the only thing that actually proves this works end to end.
+
 ## What would genuinely surprise us
 
 A result that would be a genuine, non-obvious surprise: the conviction

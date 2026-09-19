@@ -20,6 +20,7 @@ from bot.pool_events import (
     RAYDIUM_AMM_V4_PROGRAM_ID,
     RAYDIUM_INITIALIZE2_DISCRIMINATOR,
     anchor_discriminator,
+    attributed_log_lines,
     detect_pool_creation,
     matches_creation_log_hint,
     resolve_new_mint,
@@ -319,3 +320,112 @@ def test_unknown_program_id_never_matches():
 def test_empty_logs_list_does_not_match():
     assert matches_creation_log_hint([], PUMPFUN_BONDING_CURVE_PROGRAM_ID) is False
     assert matches_creation_log_hint([], RAYDIUM_AMM_V4_PROGRAM_ID) is False
+
+
+# ----------------------------------------------------------------------
+# Invoke-depth attribution. `logsSubscribe` with mentions:[program]
+# delivers the WHOLE transaction's logs, including lines written by every
+# other program in it -- so "which program emitted this line" is the
+# difference between a working pre-filter and one that fires on ordinary
+# traffic. These are the regression tests for the ~5 false-positive
+# fetches/sec measured in production.
+# ----------------------------------------------------------------------
+
+ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+
+
+def test_ata_program_create_log_does_not_match_pumpfun():
+    """THE production bug: the SPL Associated Token Account program logs
+    a line byte-identical to pump.fun's own create log. Nearly every
+    pump.fun BUY creates an ATA, so an unattributed match fired on a large
+    share of ordinary buy traffic."""
+    logs = [
+        f"Program {ATA_PROGRAM} invoke [1]",
+        "Program log: Instruction: Create",
+        f"Program {ATA_PROGRAM} success",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Buy",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+    ]
+    assert matches_creation_log_hint(logs, PUMPFUN_BONDING_CURVE_PROGRAM_ID) is False
+
+
+def test_ata_create_idempotent_does_not_match_pumpfun():
+    logs = [
+        f"Program {ATA_PROGRAM} invoke [1]",
+        "Program log: Instruction: CreateIdempotent",
+        f"Program {ATA_PROGRAM} success",
+    ]
+    assert matches_creation_log_hint(logs, PUMPFUN_BONDING_CURVE_PROGRAM_ID) is False
+
+
+def test_pumpfun_create_matches_even_when_nested_under_another_program():
+    """A create routed through an aggregator still emits its log while
+    pump.fun is the innermost invoked program -- must still match."""
+    logs = [
+        "Program SomeRouter11111111111111111111111111111111 invoke [1]",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [2]",
+        "Program log: Instruction: Create",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+        "Program SomeRouter11111111111111111111111111111111 success",
+    ]
+    assert matches_creation_log_hint(logs, PUMPFUN_BONDING_CURVE_PROGRAM_ID) is True
+
+
+def test_pumpfun_create_with_ata_create_in_the_same_tx_still_matches():
+    """A real create DOES also create accounts -- the ATA line must not
+    suppress the genuine pump.fun line alongside it."""
+    logs = [
+        f"Program {ATA_PROGRAM} invoke [1]",
+        "Program log: Instruction: CreateIdempotent",
+        f"Program {ATA_PROGRAM} success",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Create",
+        "Program data: c29tZS1ldmVudC1wYXlsb2Fk",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+    ]
+    assert matches_creation_log_hint(logs, PUMPFUN_BONDING_CURVE_PROGRAM_ID) is True
+
+
+def test_ray_log_emitted_by_another_program_is_not_attributed_to_raydium():
+    logs = [
+        "Program SomeOtherAmm1111111111111111111111111111111 invoke [1]",
+        _ray_log_line(0, b"payload"),
+        "Program SomeOtherAmm1111111111111111111111111111111 success",
+    ]
+    assert matches_creation_log_hint(logs, RAYDIUM_AMM_V4_PROGRAM_ID) is False
+
+
+def test_failed_inner_program_still_pops_the_stack():
+    """"Program <id> failed: ..." ends an invocation just like success --
+    if it didn't, every line after a failed CPI would be misattributed."""
+    logs = [
+        f"Program {ATA_PROGRAM} invoke [1]",
+        "Program log: Instruction: CreateIdempotent",
+        f"Program {ATA_PROGRAM} failed: custom program error: 0x0",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Buy",
+        f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+    ]
+    assert matches_creation_log_hint(logs, PUMPFUN_BONDING_CURVE_PROGRAM_ID) is False
+
+
+def test_log_line_before_any_invoke_is_attributed_to_nobody():
+    assert matches_creation_log_hint(["Program log: Instruction: Create"], PUMPFUN_BONDING_CURVE_PROGRAM_ID) is False
+
+
+def test_attribution_pairs_each_line_with_its_emitter():
+    logs = [
+        "Program AAA invoke [1]",
+        "Program log: outer",
+        "Program BBB invoke [2]",
+        "Program log: inner",
+        "Program BBB success",
+        "Program log: outer again",
+        "Program AAA success",
+    ]
+    assert attributed_log_lines(logs) == [
+        ("AAA", "Program log: outer"),
+        ("BBB", "Program log: inner"),
+        ("AAA", "Program log: outer again"),
+    ]

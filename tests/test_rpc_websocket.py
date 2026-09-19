@@ -52,7 +52,12 @@ class _FakeConnectCM:
 def test_ws_stats_start_at_zero():
     ws = RpcWebSocket("wss://example.invalid")
     stats = ws.get_ws_stats()
-    assert stats == {"active_connections": 0, "total_reconnects": 0, "last_drop_at": None}
+    assert stats == {
+        "active_connections": 0,
+        "total_reconnects": 0,
+        "last_drop_at": None,
+        "dropped_notifications": 0,
+    }
 
 
 def test_active_connections_increments_while_connected_and_decrements_after():
@@ -119,3 +124,122 @@ def test_reconnect_counted_and_stats_updated_on_drop():
     assert stats["total_reconnects"] == 1
     assert stats["last_drop_at"] is not None
     assert stats["active_connections"] == 0
+
+
+# ----------------------------------------------------------------------
+# The socket is drained by a dedicated task, never by the consumer.
+#
+# subscribe() used to yield straight out of `async for raw in ws`, so the
+# socket was only read as fast as the consumer processed notifications.
+# Subscribed to two of the busiest programs on Solana, with a consumer
+# that awaits a getTransaction per interesting event, that is a permanent
+# slow-consumer condition: the library's inbound queue fills, it stops
+# reading the TCP socket, and the server hangs up. In production that
+# looked like ws_active_connections=0 with ws_total_reconnects climbing.
+# ----------------------------------------------------------------------
+
+
+class _SlowConsumerConnection(_FakeConnection):
+    """Delivers every message immediately, without waiting for anyone to
+    consume them -- stands in for a firehose subscription."""
+
+
+def test_socket_is_drained_even_while_the_consumer_is_busy(tmp_path):
+    """The whole point: all messages leave the socket promptly, even
+    though the consumer never asks for the later ones."""
+    messages = [{"params": {"result": {"value": {"signature": f"sig{i}"}}}} for i in range(50)]
+    conn = _SlowConsumerConnection(messages=messages)
+    ws = RpcWebSocket("wss://example.invalid", max_buffered_notifications=64)
+
+    async def drive():
+        with mock.patch("bot.rpc_gateway.websockets.connect", return_value=_FakeConnectCM(conn)):
+            agen = ws.subscribe("logsSubscribe", [{"mentions": ["X"]}], max_reconnects=1)
+            first = await agen.__anext__()
+            assert first == {"value": {"signature": "sig0"}}
+            # Let the drain task run while the consumer does nothing.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert conn._messages == []  # socket fully drained despite an idle consumer
+            await agen.aclose()
+
+    asyncio.run(drive())
+
+
+def test_overflow_drops_oldest_and_counts_it_instead_of_stalling_the_socket():
+    """When the consumer can't keep up, falling behind must cost bounded,
+    COUNTED coverage -- not the connection itself."""
+    messages = [{"params": {"result": {"value": {"signature": f"sig{i}"}}}} for i in range(20)]
+    conn = _FakeConnection(messages=messages)
+    ws = RpcWebSocket("wss://example.invalid", max_buffered_notifications=4)
+
+    async def drive():
+        with mock.patch("bot.rpc_gateway.websockets.connect", return_value=_FakeConnectCM(conn)):
+            agen = ws.subscribe("logsSubscribe", [{"mentions": ["X"]}], max_reconnects=1)
+            first = await agen.__anext__()
+            assert first is not None
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert conn._messages == []  # still fully drained
+            await agen.aclose()
+
+    asyncio.run(drive())
+
+    assert ws.get_ws_stats()["dropped_notifications"] > 0  # overflow is visible, not silent
+
+
+def test_clean_server_close_is_treated_as_a_drop_and_reconnects():
+    """A server that closes the stream cleanly (no exception) must still
+    trigger the reconnect path rather than ending the generator."""
+    conn1 = _FakeConnection(messages=[])  # ends immediately, no exception
+    conn2 = _FakeConnection(messages=[{"params": {"result": {"value": {"signature": "after-clean-close"}}}}])
+    ws = RpcWebSocket("wss://example.invalid")
+
+    async def drive():
+        with mock.patch(
+            "bot.rpc_gateway.websockets.connect",
+            side_effect=[_FakeConnectCM(conn1), _FakeConnectCM(conn2)],
+        ), mock.patch("bot.rpc_gateway.asyncio.sleep", new=mock.AsyncMock()):
+            agen = ws.subscribe("logsSubscribe", [{"mentions": ["X"]}], max_reconnects=5)
+            got = await agen.__anext__()
+            assert got == {"value": {"signature": "after-clean-close"}}
+            await agen.aclose()
+
+    asyncio.run(drive())
+
+    assert ws.get_ws_stats()["total_reconnects"] == 1
+
+
+def test_disconnect_logs_the_reason_and_reconnect_attempt():
+    """Explicitly requested diagnostics: every disconnect must say WHY,
+    and every reconnect attempt must be visible."""
+    import logging
+
+    drop_exc = websockets.exceptions.ConnectionClosedError(None, None)
+    conn = _FakeConnection(messages=[], fail_after=drop_exc)
+    logger = logging.getLogger("test_ws_disconnect_logging")
+    logger.setLevel(logging.INFO)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger.addHandler(handler)
+
+    ws = RpcWebSocket("wss://example.invalid", logger=logger)
+
+    async def drive():
+        with mock.patch("bot.rpc_gateway.websockets.connect", return_value=_FakeConnectCM(conn)), \
+             mock.patch("bot.rpc_gateway.asyncio.sleep", new=mock.AsyncMock()):
+            [item async for item in ws.subscribe("logsSubscribe", [{"mentions": ["ProgramX"]}], max_reconnects=1)]
+
+    asyncio.run(drive())
+
+    connected = [r for r in records if r.getMessage() == "ws_connected"]
+    disconnected = [r for r in records if r.getMessage() == "ws_disconnected"]
+    assert len(connected) == 1
+    assert connected[0].fields["subscription"] == "ProgramX"
+    assert len(disconnected) == 1
+    fields = disconnected[0].fields
+    assert fields["subscription"] == "ProgramX"
+    assert "ConnectionClosedError" in fields["reason"]
+    assert fields["reconnect_attempt"] == 1
+    assert "close_code" in fields
+    assert "notifications_received" in fields

@@ -116,30 +116,96 @@ PUMPFUN_CREATE_DISCRIMINATOR = anchor_discriminator("create")
 # _matches_creation_instruction + resolve_new_mint to both succeed on the
 # real, fetched transaction. This function only decides what's worth
 # fetching in the first place.
-PUMPFUN_CREATE_LOG_SUBSTRING = "Instruction: Create"
+#
+# False positives are cheap per-event but NOT free in aggregate: the first
+# version of this matched a bare substring across the whole (whole-
+# transaction) log list and fired on a large share of ordinary pump.fun
+# buys, driving ~5 fetches/sec. That in turn starved the WebSocket
+# consumer badly enough to cause repeated server-side disconnects -- see
+# attributed_log_lines below for the mechanism and RpcWebSocket.subscribe
+# for the independent fix on the socket side.
+PUMPFUN_CREATE_LOG_LINE = "Program log: Instruction: Create"
 _RAY_LOG_MARKER = "ray_log: "
 _RAYDIUM_INIT_LOG_TYPE = 0
+
+
+def attributed_log_lines(logs: list[str]) -> list[tuple[str, str]]:
+    """Pairs every log line with the program that actually EMITTED it, by
+    replaying Solana's invoke/success bracketing to track the call stack:
+
+        Program <id> invoke [1]        <- push <id>
+        Program log: Instruction: Foo  <- emitted BY <id>
+        Program <inner> invoke [2]     <- push <inner>
+        Program log: Instruction: Bar  <- emitted BY <inner>, NOT by <id>
+        Program <inner> success        <- pop
+        Program <id> success           <- pop
+
+    This attribution is not a nicety, it's the whole correctness of the
+    pre-filter. A `logsSubscribe` subscription filtered on `mentions:
+    [<program>]` delivers the ENTIRE transaction's logs, including every
+    OTHER program invoked in it -- so a bare substring search over the raw
+    list matches text that a completely unrelated program wrote.
+
+    That is exactly what happened in production: the SPL Associated Token
+    Account program logs `Program log: Instruction: Create` (and
+    `Instruction: CreateIdempotent`) when it creates a buyer's token
+    account -- byte-identical to what pump.fun's own Anchor dispatcher
+    logs for its `create` instruction. Nearly every pump.fun BUY creates
+    an ATA, so an unattributed match fired on a large share of ordinary
+    buy traffic: ~5 fetches/sec, every one of them correctly reported
+    `matched: false` by the precise discriminator check downstream. Note
+    an exact-string comparison alone does NOT fix this, because the ATA
+    program's line is not merely similar to pump.fun's, it is identical --
+    only knowing WHO emitted it separates them.
+
+    A line before any `invoke` (or after the stack has unwound) is
+    attributed to "", which matches no program and is therefore ignored.
+    """
+    stack: list[str] = []
+    out: list[tuple[str, str]] = []
+    for raw_line in logs:
+        line = raw_line.strip()
+        parts = line.split(" ")
+        if len(parts) >= 3 and parts[0] == "Program" and parts[2] == "invoke":
+            stack.append(parts[1])
+            continue
+        if len(parts) >= 3 and parts[0] == "Program" and parts[2] in ("success", "failed"):
+            if stack:
+                stack.pop()
+            continue
+        out.append((stack[-1] if stack else "", line))
+    return out
 
 
 def matches_creation_log_hint(logs: list[str], program_id: str) -> bool:
     """True if `logs` (a logsSubscribe notification's own log lines --
     see Orchestrator._index_program_loop) already look like a creation
-    for `program_id`, with zero RPC calls made to decide this."""
-    if program_id == PUMPFUN_BONDING_CURVE_PROGRAM_ID:
-        return any(PUMPFUN_CREATE_LOG_SUBSTRING in line for line in logs)
-    if program_id == RAYDIUM_AMM_V4_PROGRAM_ID:
-        for line in logs:
-            marker_at = line.find(_RAY_LOG_MARKER)
-            if marker_at == -1:
-                continue
-            payload = line[marker_at + len(_RAY_LOG_MARKER):].strip()
-            try:
-                decoded = base64.b64decode(payload, validate=False)
-            except ValueError:
-                continue
-            if decoded and decoded[0] == _RAYDIUM_INIT_LOG_TYPE:
-                return True
+    for `program_id`, with zero RPC calls made to decide this.
+
+    Only lines `program_id` itself emitted are considered -- see
+    attributed_log_lines for why that qualifier is load-bearing.
+    """
+    if program_id not in (PUMPFUN_BONDING_CURVE_PROGRAM_ID, RAYDIUM_AMM_V4_PROGRAM_ID):
         return False
+    for emitter, line in attributed_log_lines(logs):
+        if emitter != program_id:
+            continue
+        if program_id == PUMPFUN_BONDING_CURVE_PROGRAM_ID:
+            # Exact, not a substring: "Instruction: CreateIdempotent" must
+            # never match "Instruction: Create".
+            if line == PUMPFUN_CREATE_LOG_LINE:
+                return True
+            continue
+        marker_at = line.find(_RAY_LOG_MARKER)
+        if marker_at == -1:
+            continue
+        payload = line[marker_at + len(_RAY_LOG_MARKER):].strip()
+        try:
+            decoded = base64.b64decode(payload, validate=False)
+        except ValueError:
+            continue
+        if decoded and decoded[0] == _RAYDIUM_INIT_LOG_TYPE:
+            return True
     return False
 
 

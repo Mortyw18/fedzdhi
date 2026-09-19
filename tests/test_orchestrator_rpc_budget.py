@@ -553,12 +553,41 @@ def test_index_loop_skips_all_notifications_when_budget_is_tight(tmp_path):
 # ----------------------------------------------------------------------
 
 
+ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+
+
 def _creation_notification(signature: str) -> dict:
-    return {"value": {"signature": signature, "logs": ["Program log: Instruction: Create"]}}
+    return {
+        "value": {
+            "signature": signature,
+            "logs": [
+                f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [1]",
+                "Program log: Instruction: Create",
+                f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+            ],
+        }
+    }
 
 
 def _ordinary_notification(signature: str) -> dict:
-    return {"value": {"signature": signature, "logs": ["Program log: Instruction: Buy"]}}
+    """An ordinary pump.fun BUY that also creates the buyer's associated
+    token account -- the shape that caused ~5 false-positive fetches/sec
+    in production. The ATA program's "Instruction: Create" log line is
+    byte-identical to pump.fun's, so only invoke-depth attribution tells
+    them apart."""
+    return {
+        "value": {
+            "signature": signature,
+            "logs": [
+                f"Program {ATA_PROGRAM} invoke [1]",
+                "Program log: Instruction: Create",
+                f"Program {ATA_PROGRAM} success",
+                f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} invoke [1]",
+                "Program log: Instruction: Buy",
+                f"Program {PUMPFUN_BONDING_CURVE_PROGRAM_ID} success",
+            ],
+        }
+    }
 
 
 def test_index_loop_fetches_a_creation_candidate_even_with_calls_per_minute_cap_exhausted(tmp_path):
@@ -625,6 +654,37 @@ def test_index_loop_candidate_fetch_still_respects_the_rpc_budget_ceiling(tmp_pa
 
     assert orch.rpc.call_count == 0
     assert orch._indexing_skipped_count == 1
+
+
+def test_raw_log_samples_are_logged_then_stop(tmp_path):
+    """Ground-truth diagnostics: the first few notifications per program
+    are dumped verbatim with the pre-filter's verdict, then it goes
+    quiet -- the only way to tell "matcher broken" from "stream carries no
+    creations", without flooding the log for the rest of the run."""
+    import logging
+
+    orch = _build_orchestrator(tmp_path)
+    orch.config.ws_raw_log_sample_count = 2
+    orch.rpc = _AlwaysSucceedsRpc()
+    orch._ws = _FakeWs([_ordinary_notification(f"sig{i}") for i in range(5)])
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    orch.logger.addHandler(handler)
+
+    async def drive() -> None:
+        orch.stop_event = asyncio.Event()
+        await orch._index_program_loop(PUMPFUN_BONDING_CURVE_PROGRAM_ID)
+
+    asyncio.run(drive())
+
+    samples = [r for r in records if r.getMessage() == "ws_raw_log_sample"]
+    assert len(samples) == 2  # capped, not one per notification
+    fields = samples[0].fields
+    assert fields["program"] == "pumpfun_bonding_curve"
+    assert fields["hint_matched"] is False  # an ATA-creating buy is NOT a create
+    assert any("Instruction: Buy" in line for line in fields["logs"])
 
 
 def test_index_loop_candidate_fetch_disabled_when_event_driven_discovery_off(tmp_path):

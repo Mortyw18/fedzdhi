@@ -269,6 +269,15 @@ class Config:
     # Accounting, so `--daily-report` can show the RPC budget after the
     # fact even though that one-shot command never starts a live gateway.
     rpc_budget_snapshot_interval_s: float = 60.0
+    # How many raw logsSubscribe notifications to dump verbatim (per
+    # indexed program, once per run) alongside what the creation
+    # pre-filter concluded about them. This is the only way to tell "the
+    # matcher is broken" apart from "the stream genuinely carries no
+    # creations" -- the two look identical from a matched-count of zero
+    # and need opposite fixes. Cheap: a fixed, tiny number of log lines
+    # at startup, then silent for the rest of the run. Set to 0 to
+    # disable.
+    ws_raw_log_sample_count: int = 5
     # INFO-level proof-of-life log: poll counts, RPC usage, WS status, and
     # (as of this run) event-driven-discovery totals (ws_pool_events_seen /
     # matched / dispatched / rejected, ws_active_connections). Exists so an
