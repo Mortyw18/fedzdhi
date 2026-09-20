@@ -15,7 +15,7 @@ import signal
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from nacl.signing import SigningKey
 
@@ -37,7 +37,12 @@ from bot.models import (
     WalletBuyRecord,
     WalletSellRecord,
 )
-from bot.pool_events import PoolCreationEvent, detect_pool_creation, matches_creation_log_hint
+from bot.pool_events import (
+    PoolCreationEvent,
+    attributed_log_lines,
+    detect_pool_creation,
+    matches_creation_log_hint,
+)
 from bot.risk_manager import RiskManager
 from bot.rpc_gateway import RpcGateway, RpcMethodDisabled, RpcOutage, RpcWebSocket
 from bot.signal_engine import SignalEngine
@@ -214,6 +219,21 @@ class Orchestrator:
         # "event-driven discovery + second-wave entry" section.
         self._pending_second_wave: dict[str, _PendingPool] = {}
         self._ws_raw_log_samples: Counter[str] = Counter()  # per program, capped by ws_raw_log_sample_count
+        self._hint_pass_samples: Counter[str] = Counter()
+        # Exact per-stage funnel counts. These exist because a production
+        # day produced two numbers that could not both be true
+        # (pool_event_checked at ~120/min against rpc_calls_per_minute=61),
+        # and nothing recorded where the discrepancy was: hint passes
+        # weren't counted at all, and fetches weren't split by which path
+        # made them. Every stage is now counted separately, and the
+        # heartbeat reports per-interval deltas so rates are read rather
+        # than estimated from a log tail.
+        self._heartbeat_prev_totals: dict[str, int] = {}
+        self._heartbeat_last_at = time.monotonic()
+        self._hint_passes = 0               # notifications whose logs matched the creation hint
+        self._candidate_fetches = 0         # getTransaction calls made BY the fast path
+        self._candidate_fetches_skipped = 0  # hint passed but the fetch was gated (budget/kill switch/backoff)
+        self._broad_fetches = 0             # getTransaction calls made by the broad InsiderRadar sample
         self._pool_events_seen = 0          # every notification actually checked (post RPC-budget throttling)
         self._pool_events_matched = 0       # of those, matched a creation/launch instruction with a resolved mint
         self._second_wave_dispatched_count = 0
@@ -775,10 +795,24 @@ class Orchestrator:
             )
             return None
 
+    def _creation_prefilter(self, program_id: str) -> Callable[[dict], bool]:
+        """Runs inside the WS drain task, on the socket side, so a
+        notification that looks like a creation is buffered in a lane
+        overflow never evicts. Without this the buffer discarded the
+        oldest of EVERYTHING under load, which threw away real creations
+        at exactly the same rate as the swap traffic burying them."""
+
+        def _prefilter(notification: dict) -> bool:
+            logs = ((notification.get("value") or {}).get("logs")) or []
+            return matches_creation_log_hint(logs, program_id)
+
+        return _prefilter
+
     async def _index_program_loop(self, program_id: str) -> None:
         if self._ws is None:
             return
-        async for notification in self._ws.logs_subscribe(program_id):
+        prefilter = self._creation_prefilter(program_id) if self.config.enable_event_driven_discovery else None
+        async for notification in self._ws.logs_subscribe(program_id, prefilter=prefilter):
             if self.stop_event.is_set():
                 return
             value = notification.get("value") or {}
@@ -818,11 +852,34 @@ class Orchestrator:
             # rare pool-creation event once real traffic (thousands/min)
             # exceeded that sample by orders of magnitude.
             if self.config.enable_event_driven_discovery and matches_creation_log_hint(logs, program_id):
+                self._hint_passes += 1
+                # Show what is actually getting through, not just how much.
+                # A pass count alone can't distinguish "the hint is too
+                # loose" from "there really were that many creations" --
+                # the attributed log lines can, immediately.
+                if self._hint_pass_samples[program_id] < self.config.ws_raw_log_sample_count:
+                    self._hint_pass_samples[program_id] += 1
+                    self.logger.info(
+                        "hint_pass_sample",
+                        extra={
+                            "fields": {
+                                "program": INDEXED_PROGRAM_IDS.get(program_id, program_id),
+                                "sample": self._hint_pass_samples[program_id],
+                                "signature": signature,
+                                "emitted_by_target": [
+                                    line for emitter, line in attributed_log_lines(logs)
+                                    if emitter == program_id
+                                ][:20],
+                            }
+                        },
+                    )
                 skip_reason = self._candidate_fetch_skip_reason()
                 if skip_reason is not None:
                     self._indexing_skipped_count += 1
+                    self._candidate_fetches_skipped += 1
                     self.logger.debug("pool creation candidate dropped: %s", skip_reason)
                 else:
+                    self._candidate_fetches += 1
                     tx = await self._fetch_indexed_transaction(signature, program_id)
                     if tx:
                         self._parse_leader_activity(tx, signature)
@@ -852,6 +909,7 @@ class Orchestrator:
             self._indexing_last_call_at = time.monotonic()
             self._indexing_call_timestamps.append(self._indexing_last_call_at)
 
+            self._broad_fetches += 1
             tx = await self._fetch_indexed_transaction(signature, program_id)
             if tx:
                 self._parse_leader_activity(tx, signature)
@@ -904,12 +962,39 @@ class Orchestrator:
             await asyncio.sleep(self.config.heartbeat_interval_s)
             rpc_stats = self.rpc.get_call_stats()
             ws_stats = self._ws.get_ws_stats() if self._ws is not None else {
-                "active_connections": 0, "total_reconnects": 0, "last_drop_at": None, "dropped_notifications": 0,
+                "active_connections": 0, "total_reconnects": 0, "last_drop_at": None,
+                "dropped_notifications": 0, "dropped_priority_notifications": 0,
+                "notifications_received": 0, "prefilter_passes": 0,
             }
+            # Per-interval deltas on the cumulative counters. A running
+            # total answers "how much since startup"; only a delta answers
+            # "at what rate, right now" -- and every open question about
+            # this funnel has been a rate question that had to be
+            # eyeballed from a log tail instead of read off a number.
+            totals = {
+                "ws_notifications_received": ws_stats["notifications_received"],
+                "ws_hint_passes": self._hint_passes,
+                "ws_dropped_notifications": ws_stats["dropped_notifications"],
+                "ws_dropped_candidates": ws_stats["dropped_priority_notifications"],
+                "indexing_candidate_fetches": self._candidate_fetches,
+                "indexing_candidate_fetches_skipped": self._candidate_fetches_skipped,
+                "indexing_broad_fetches": self._broad_fetches,
+                "ws_pool_events_seen": self._pool_events_seen,
+                "ws_pool_events_matched": self._pool_events_matched,
+            }
+            elapsed = max(time.monotonic() - self._heartbeat_last_at, 1e-9)
+            deltas = {
+                f"{name}_per_min": round((value - self._heartbeat_prev_totals.get(name, 0)) * 60.0 / elapsed, 1)
+                for name, value in totals.items()
+            }
+            self._heartbeat_prev_totals = dict(totals)
+            self._heartbeat_last_at = time.monotonic()
             self.logger.info(
                 "heartbeat",
                 extra={
                     "fields": {
+                        **totals,
+                        **deltas,
                         "dexscreener_polls_done": self.signal_engine.dexscreener_polls_done,
                         "pumpfun_polls_done": self.signal_engine.pumpfun_polls_done,
                         "pumpfun_disabled": self.signal_engine.pumpfun_disabled,
@@ -918,17 +1003,11 @@ class Orchestrator:
                         "rpc_total_calls": rpc_stats["total_calls"],
                         "ws_active_connections": ws_stats["active_connections"],
                         "ws_total_reconnects": ws_stats["total_reconnects"],
-                        # Non-zero means the consumer fell behind the
-                        # firehose and lost coverage -- bounded and
-                        # counted, rather than losing the connection.
-                        "ws_dropped_notifications": ws_stats["dropped_notifications"],
                         "kill_switch_halted": self.kill_switch.is_halted(),
                         "open_positions": len(self.open_positions),
                         "indexing_skipped": self._indexing_skipped_count,
                         "indexing_backing_off": self._indexing_backoff_until > time.monotonic(),
                         "rpc_disabled_methods": rpc_stats["disabled_methods"],
-                        "ws_pool_events_seen": self._pool_events_seen,
-                        "ws_pool_events_matched": self._pool_events_matched,
                         "second_wave_pending": len(self._pending_second_wave),
                         "second_wave_dispatched_total": self._second_wave_dispatched_count,
                         "second_wave_expired_total": self._second_wave_expired_count,

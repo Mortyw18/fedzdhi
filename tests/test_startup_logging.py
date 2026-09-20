@@ -32,7 +32,7 @@ class _FakeWsNoNotifications:
     def get_ws_stats(self):
         return {"active_connections": 0, "total_reconnects": 0, "last_drop_at": None}
 
-    async def logs_subscribe(self, program_id):
+    async def logs_subscribe(self, program_id, prefilter=None):
         return
         yield  # pragma: no cover -- makes this an async generator; never reached
 

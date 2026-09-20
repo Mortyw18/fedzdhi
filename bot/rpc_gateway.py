@@ -621,6 +621,65 @@ class _StreamEnded:
         self.exc = exc
 
 
+class _NotificationBuffer:
+    """Bounded buffer with two lanes, drained priority-first.
+
+    A single-lane queue that discards the oldest item on overflow treats
+    every notification as equally expendable. For this workload they are
+    not: the broad sample feeding InsiderRadar is fungible (any swap is as
+    good as any other), while a pool creation is the rare thing the whole
+    event-driven path exists to catch. Dropping them at the same rate --
+    which is what happened, 4883 times in one day -- silently discards
+    real creations to make room for swaps.
+
+    So each lane has its own capacity and overflow only ever evicts from
+    the lane that overflowed. Ordinary traffic can churn through its lane
+    as fast as it likes without ever displacing a pending candidate.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self._priority: deque = deque()
+        self._sample: deque = deque()
+        self._end: Optional[Any] = None
+        self._maxsize = max(1, maxsize)
+        self._wakeup = asyncio.Event()
+        self.dropped_sample = 0
+        self.dropped_priority = 0
+
+    def offer(self, item: Any, priority: bool) -> None:
+        lane = self._priority if priority else self._sample
+        if len(lane) >= self._maxsize:
+            lane.popleft()
+            if priority:
+                # Only reachable if candidates arrive faster than they can
+                # be fetched for a sustained stretch -- genuinely bad, and
+                # deliberately counted separately so it can never hide
+                # inside the ordinary drop count.
+                self.dropped_priority += 1
+            else:
+                self.dropped_sample += 1
+        lane.append(item)
+        self._wakeup.set()
+
+    def close(self, marker: Any) -> None:
+        """End-of-stream is held OUTSIDE both lanes, and only surfaces
+        once they are empty. Putting it in a lane instead lets it overtake
+        notifications already buffered behind it -- silently discarding
+        everything still pending at the moment the socket dropped."""
+        self._end = marker
+        self._wakeup.set()
+
+    async def get(self) -> Any:
+        while not self._priority and not self._sample and self._end is None:
+            self._wakeup.clear()
+            await self._wakeup.wait()
+        if self._priority:
+            return self._priority.popleft()
+        if self._sample:
+            return self._sample.popleft()
+        return self._end
+
+
 class RpcWebSocket:
     """Async wrapper over Helius WebSocket logsSubscribe/accountSubscribe.
 
@@ -680,6 +739,14 @@ class RpcWebSocket:
         # loss -- but bounded, visible loss, instead of a dropped
         # connection that loses everything until it reconnects.
         self.dropped_notifications = 0
+        # Dropped from the PRIORITY lane -- i.e. a notification the
+        # prefilter flagged as interesting that still had to be discarded.
+        # Distinct from dropped_notifications on purpose: the ordinary
+        # count is expected to be non-zero on a firehose and is harmless,
+        # this one means real candidates were lost and is never harmless.
+        self.dropped_priority_notifications = 0
+        self.notifications_received = 0
+        self.prefilter_passes = 0
         self.max_buffered_notifications = max_buffered_notifications
 
     def get_ws_stats(self) -> dict:
@@ -688,6 +755,9 @@ class RpcWebSocket:
             "total_reconnects": self.total_reconnects,
             "last_drop_at": self.last_drop_at,
             "dropped_notifications": self.dropped_notifications,
+            "dropped_priority_notifications": self.dropped_priority_notifications,
+            "notifications_received": self.notifications_received,
+            "prefilter_passes": self.prefilter_passes,
         }
 
     @staticmethod
@@ -701,40 +771,73 @@ class RpcWebSocket:
             return params["result"]
         return None
 
-    def _offer(self, queue: "asyncio.Queue", item: Any) -> None:
-        """Never blocks: makes room by discarding the OLDEST pending item.
+    def _offer(self, queue: "_NotificationBuffer", item: Any, priority: bool = True) -> None:
+        """Never blocks: makes room by discarding the OLDEST item in the
+        same lane. Blocking here would defeat the entire point of the
+        drain task -- it would reintroduce exactly the consumer-driven
+        backpressure that was killing the connection."""
+        queue.offer(item, priority=priority)
 
-        Blocking here would defeat the entire point of the drain task --
-        it would reintroduce exactly the consumer-driven backpressure that
-        was killing the connection.
-        """
-        if queue.full():
-            try:
-                queue.get_nowait()
-                self.dropped_notifications += 1
-            except asyncio.QueueEmpty:  # pragma: no cover -- racy only under multiple consumers
-                pass
-        queue.put_nowait(item)
-
-    async def _drain_socket(self, ws: Any, queue: "asyncio.Queue") -> None:
+    async def _drain_socket(
+        self,
+        ws: Any,
+        queue: "_NotificationBuffer",
+        prefilter: Optional[Callable[[dict], bool]] = None,
+    ) -> None:
         """Read the socket as fast as it delivers, independent of the
-        consumer, and signal end-of-stream (with the cause) exactly once."""
+        consumer, and signal end-of-stream (with the cause) exactly once.
+
+        `prefilter` runs HERE, on the socket side, rather than in the
+        consumer -- that placement is the whole point. Overflow used to
+        discard notifications before anything had looked at them, so a
+        rare pool creation was thrown away at exactly the same rate as
+        the ordinary swap traffic it was buried in (4883 indiscriminate
+        drops in one production day). Deciding "is this interesting"
+        costs nothing but a string scan, so doing it before buffering
+        means the interesting ones go into a lane that overflow never
+        touches, and only the broad, fungible sample absorbs the loss.
+        """
         try:
             async for raw in ws:
                 payload = self._decode_notification(raw)
                 if payload is not None:
-                    self._offer(queue, payload)
+                    self.notifications_received += 1
+                    # With no prefilter there is nothing to prioritize ON,
+                    # so everything shares one lane and drops are ordinary
+                    # -- priority would otherwise be meaningless AND make
+                    # every drop look like a lost candidate.
+                    priority = False
+                    if prefilter is not None:
+                        try:
+                            priority = bool(prefilter(payload))
+                        except Exception:  # noqa: BLE001 -- a broken prefilter must not kill the stream
+                            self.logger.exception("ws_prefilter_failed")
+                            priority = True  # fail safe: never silently downgrade on a bug
+                        if priority:
+                            self.prefilter_passes += 1
+                    self._offer(queue, payload, priority=priority)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 -- reraised in the consumer, which owns reconnect policy
-            self._offer(queue, _StreamEnded(exc))
+            queue.close(_StreamEnded(exc))
             return
-        self._offer(queue, _StreamEnded(None))
+        queue.close(_StreamEnded(None))
 
     async def subscribe(
-        self, method: str, params: list, max_reconnects: int = 1_000_000
+        self,
+        method: str,
+        params: list,
+        max_reconnects: int = 1_000_000,
+        prefilter: Optional[Callable[[dict], bool]] = None,
     ) -> AsyncIterator[dict]:
-        """Yield notification `params.result` payloads forever, reconnecting on drop."""
+        """Yield notification `params.result` payloads forever, reconnecting on drop.
+
+        `prefilter` marks a notification as interesting BEFORE it is
+        buffered, putting it in a lane that overflow never evicts -- see
+        _drain_socket. Without one, every notification is treated as
+        interesting (so nothing is ever preferentially dropped) and the
+        buffer behaves exactly as it did before.
+        """
         attempt = 0
         label = _subscription_label(params)
         while attempt < max_reconnects:
@@ -742,7 +845,9 @@ class RpcWebSocket:
             drain: Optional[asyncio.Task] = None
             connected_at = 0.0
             received = 0
+            queue = _NotificationBuffer(self.max_buffered_notifications)
             dropped_at_connect = self.dropped_notifications
+            dropped_priority_at_connect = self.dropped_priority_notifications
             try:
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as ws:
                     sub_request = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -765,8 +870,7 @@ class RpcWebSocket:
                             }
                         },
                     )
-                    queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_buffered_notifications)
-                    drain = asyncio.create_task(self._drain_socket(ws, queue))
+                    drain = asyncio.create_task(self._drain_socket(ws, queue, prefilter))
                     try:
                         while True:
                             item = await queue.get()
@@ -775,11 +879,23 @@ class RpcWebSocket:
                                     raise item.exc
                                 raise RpcError(f"{method} stream closed by server")
                             received += 1
+                            # The buffer owns the drop bookkeeping; mirror
+                            # it onto the gateway so get_ws_stats() (and
+                            # the heartbeat) see it without reaching into
+                            # a per-connection object that dies on reconnect.
+                            self.dropped_notifications = dropped_at_connect + queue.dropped_sample
+                            self.dropped_priority_notifications = (
+                                dropped_priority_at_connect + queue.dropped_priority
+                            )
                             yield item
                     finally:
                         self.active_connections -= 1
                         if drain is not None:
                             drain.cancel()
+                        self.dropped_notifications = dropped_at_connect + queue.dropped_sample
+                        self.dropped_priority_notifications = (
+                            dropped_priority_at_connect + queue.dropped_priority
+                        )
             except (websockets.exceptions.WebSocketException, OSError, RpcError) as exc:
                 attempt += 1
                 self.total_reconnects += 1
@@ -803,7 +919,8 @@ class RpcWebSocket:
                             "close_reason": getattr(ws, "close_reason", None),
                             "connection_uptime_s": round(time.monotonic() - connected_at, 1) if connected_at else 0.0,
                             "notifications_received": received,
-                            "notifications_dropped_this_connection": self.dropped_notifications - dropped_at_connect,
+                            "notifications_dropped_this_connection": queue.dropped_sample,
+                            "candidates_dropped_this_connection": queue.dropped_priority,
                             "reconnect_attempt": attempt,
                             "retry_in_s": delay,
                         }
@@ -815,10 +932,13 @@ class RpcWebSocket:
                     extra={"fields": {"method": method, "subscription": label, "attempt": attempt}},
                 )
 
-    def logs_subscribe(self, mentions_address: str) -> AsyncIterator[dict]:
+    def logs_subscribe(
+        self, mentions_address: str, prefilter: Optional[Callable[[dict], bool]] = None
+    ) -> AsyncIterator[dict]:
         return self.subscribe(
             "logsSubscribe",
             [{"mentions": [mentions_address]}, {"commitment": "confirmed"}],
+            prefilter=prefilter,
         )
 
     def account_subscribe(self, pubkey: str) -> AsyncIterator[dict]:

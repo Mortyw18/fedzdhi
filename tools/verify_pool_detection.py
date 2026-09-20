@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -87,6 +88,14 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=100, help="How many recent signatures to scan (default 100).")
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--verbose", action="store_true", help="Print attributed log lines for each transaction.")
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=0.0,
+        help="Seconds to pause between fetches. The bot and this script share one RPC key and one rate "
+        "limit, so a scan run alongside a live bot will spend most of its time in cooldown and finish "
+        "only a fraction of --limit. Stop the bot first for a clean run; use this to pace it otherwise.",
+    )
     args = parser.parse_args()
 
     if not args.scan and not args.signature:
@@ -123,18 +132,24 @@ def main() -> int:
     checked = 0
     disagreements: list[tuple[str, bool, bool]] = []
 
-    for entry in signatures:
+    failures = 0
+    for index, entry in enumerate(signatures, start=1):
         signature = entry.get("signature")
         if not signature or entry.get("err"):
             continue  # a failed transaction never created anything
+        if args.sleep:
+            time.sleep(args.sleep)
         try:
             tx = _fetch_transaction(rpc, signature)
         except Exception as exc:  # noqa: BLE001 -- a diagnostic script should keep going
-            print(f"  {signature[:16]}... fetch failed: {exc}")
+            failures += 1
+            print(f"  [{index}/{len(signatures)}] {signature[:16]}... fetch failed: {exc}")
             continue
         if not tx:
             continue
         checked += 1
+        if checked % 25 == 0:
+            print(f"  ...{checked} checked ({hint_hits} hint, {detected_hits} detected, {failures} failed)")
         hint, detected, mint = _check(tx, signature, program_id, verbose=args.verbose)
         if hint:
             hint_hits += 1
@@ -145,9 +160,11 @@ def main() -> int:
         if hint != detected:
             disagreements.append((signature, hint, detected))
 
-    print(f"\n--- {checked} transactions checked ---")
+    print(f"\n--- {checked} of {len(signatures)} transactions checked ---")
     print(f"  pre-filter matched : {hint_hits}")
     print(f"  fully detected     : {detected_hits}")
+    if failures:
+        print(f"  fetches failed     : {failures}  (rate limiting -- stop the bot and re-run for a clean scan)")
     if disagreements:
         print(f"\n  {len(disagreements)} disagreement(s) between the two stages:")
         for signature, hint, detected in disagreements[:10]:

@@ -100,7 +100,7 @@ class _FakeWs:
     def __init__(self, notifications: list[dict]) -> None:
         self._notifications = notifications
 
-    async def logs_subscribe(self, program_id):
+    async def logs_subscribe(self, program_id, prefilter=None):
         for n in self._notifications:
             yield n
 

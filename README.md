@@ -710,6 +710,31 @@ against REAL mainnet transactions using your own RPC key
 only check that can prove the log shapes this depends on still match what
 the chain actually emits.
 
+**The hint runs on the socket side, not in the consumer.** It is passed
+into `logs_subscribe(prefilter=...)` and evaluated inside the drain task,
+so a hint-passing notification lands in a priority lane that buffer
+overflow never evicts. This placement matters: overflow previously
+discarded the oldest of *everything*, which threw away real creations at
+exactly the same rate as the swap traffic burying them (4883
+indiscriminate drops in one production day). Now only the fungible broad
+sample absorbs the loss, and `ws_dropped_candidates` — which should stay
+at 0 — is counted separately from `ws_dropped_notifications`, which is
+expected to be non-zero on a firehose and is harmless.
+
+**Reading the funnel.** The heartbeat carries each stage as both a
+running total and a `_per_min` delta, so rates are read rather than
+estimated from a log tail:
+`ws_notifications_received` → `ws_hint_passes` →
+`indexing_candidate_fetches` (+ `indexing_candidate_fetches_skipped`
+when a candidate was gated by budget/kill-switch/backoff) →
+`ws_pool_events_seen` → `ws_pool_events_matched`, with
+`indexing_broad_fetches` covering InsiderRadar's separate sample. Note
+`pool_event_checked` fires *after* a fetch, so it counts fetches, never
+hint passes — `ws_hint_passes_per_min` is the only measure of how loose
+the hint is. `hint_pass_sample` logs the first few passes per program
+with the target program's own log lines, which shows *what* is getting
+through, not just how much.
+
 **WebSocket health.** `ws_active_connections` near 0 with
 `ws_total_reconnects` climbing means the subscription is flapping. The
 cause this bot hit was a slow consumer, not a connection limit: the

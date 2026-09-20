@@ -57,6 +57,9 @@ def test_ws_stats_start_at_zero():
         "total_reconnects": 0,
         "last_drop_at": None,
         "dropped_notifications": 0,
+        "dropped_priority_notifications": 0,
+        "notifications_received": 0,
+        "prefilter_passes": 0,
     }
 
 
@@ -207,6 +210,83 @@ def test_clean_server_close_is_treated_as_a_drop_and_reconnects():
     asyncio.run(drive())
 
     assert ws.get_ws_stats()["total_reconnects"] == 1
+
+
+def test_prefiltered_candidates_are_never_evicted_by_ordinary_traffic():
+    """The whole reason the prefilter runs on the socket side: a single
+    candidate must survive a flood of ordinary traffic many times the
+    buffer size. Before this, overflow discarded the oldest of
+    EVERYTHING, so a real creation was thrown away at the same rate as
+    the swaps burying it (4883 indiscriminate drops in one day)."""
+    candidate = {"params": {"result": {"value": {"signature": "CANDIDATE", "logs": ["create"]}}}}
+    noise = [
+        {"params": {"result": {"value": {"signature": f"noise{i}", "logs": ["swap"]}}}}
+        for i in range(200)
+    ]
+    conn = _FakeConnection(messages=[candidate] + noise)
+    ws = RpcWebSocket("wss://example.invalid", max_buffered_notifications=4)
+
+    def prefilter(notification):
+        return "create" in ((notification.get("value") or {}).get("logs") or [])
+
+    seen: list[str] = []
+
+    async def drive():
+        with mock.patch("bot.rpc_gateway.websockets.connect", return_value=_FakeConnectCM(conn)):
+            agen = ws.subscribe("logsSubscribe", [{"mentions": ["X"]}], max_reconnects=1, prefilter=prefilter)
+            # Let the drain task ingest everything before consuming any of it.
+            first = await agen.__anext__()
+            seen.append(first["value"]["signature"])
+            await agen.aclose()
+
+    asyncio.run(drive())
+
+    assert seen == ["CANDIDATE"]  # served first, and never evicted
+    stats = ws.get_ws_stats()
+    assert stats["prefilter_passes"] == 1
+    assert stats["notifications_received"] == 201
+    assert stats["dropped_notifications"] > 0          # the noise absorbed all the loss
+    assert stats["dropped_priority_notifications"] == 0  # the candidate never did
+
+
+def test_buffered_notifications_are_drained_before_end_of_stream():
+    """End-of-stream must not overtake what is already buffered -- doing
+    so silently discards every pending notification at the instant the
+    socket drops."""
+    messages = [{"params": {"result": {"value": {"signature": f"sig{i}"}}}} for i in range(3)]
+    conn = _FakeConnection(messages=messages)
+    ws = RpcWebSocket("wss://example.invalid")
+
+    async def drive():
+        with mock.patch("bot.rpc_gateway.websockets.connect", return_value=_FakeConnectCM(conn)), \
+             mock.patch("bot.rpc_gateway.asyncio.sleep", new=mock.AsyncMock()):
+            return [item async for item in ws.subscribe("logsSubscribe", [{"mentions": ["X"]}], max_reconnects=1)]
+
+    got = asyncio.run(drive())
+
+    assert [item["value"]["signature"] for item in got] == ["sig0", "sig1", "sig2"]
+
+
+def test_a_raising_prefilter_does_not_kill_the_stream():
+    """A bug in the matcher must degrade to "treat it as interesting",
+    never to a dead subscription."""
+    conn = _FakeConnection(messages=[{"params": {"result": {"value": {"signature": "sig1"}}}}])
+    ws = RpcWebSocket("wss://example.invalid")
+
+    def exploding_prefilter(_notification):
+        raise ValueError("matcher bug")
+
+    async def drive():
+        with mock.patch("bot.rpc_gateway.websockets.connect", return_value=_FakeConnectCM(conn)), \
+             mock.patch("bot.rpc_gateway.asyncio.sleep", new=mock.AsyncMock()):
+            agen = ws.subscribe(
+                "logsSubscribe", [{"mentions": ["X"]}], max_reconnects=1, prefilter=exploding_prefilter
+            )
+            got = await agen.__anext__()
+            await agen.aclose()
+            return got
+
+    assert asyncio.run(drive()) == {"value": {"signature": "sig1"}}
 
 
 def test_disconnect_logs_the_reason_and_reconnect_attempt():
